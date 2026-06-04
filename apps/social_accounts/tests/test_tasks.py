@@ -11,9 +11,7 @@ from apps.social_accounts.tasks import check_social_account_health
 from providers.types import AccountProfile, OAuthTokens
 
 
-def _profile(
-    *, follower_count=0, avatar_url=None, name="", handle=None, platform_id="123"
-):
+def _profile(*, follower_count=0, avatar_url=None, name="", handle=None, platform_id="123"):
     return AccountProfile(
         platform_id=platform_id,
         name=name,
@@ -143,9 +141,7 @@ class TestCheckSocialAccountHealth:
         assert account.account_handle == "new"
 
     @patch("providers.get_provider")
-    def test_health_check_preserves_avatar_when_provider_returns_empty(
-        self, mock_get_provider, connected_account
-    ):
+    def test_health_check_preserves_avatar_when_provider_returns_empty(self, mock_get_provider, connected_account):
         connected_account.avatar_url = "https://old.example/avatar.jpg"
         connected_account.account_name = "Kept Name"
         connected_account.account_handle = "kept"
@@ -163,9 +159,7 @@ class TestCheckSocialAccountHealth:
         assert account.account_handle == "kept"
 
     @patch("providers.get_provider")
-    def test_failed_health_check_preserves_profile_fields(
-        self, mock_get_provider, connected_account
-    ):
+    def test_failed_health_check_preserves_profile_fields(self, mock_get_provider, connected_account):
         connected_account.avatar_url = "https://old.example/avatar.jpg"
         connected_account.account_name = "Kept Name"
         connected_account.account_handle = "kept"

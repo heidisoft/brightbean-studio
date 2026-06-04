@@ -1,8 +1,12 @@
 """Instagram API with Instagram Login provider.
 
-Supports personal, creator, and business Instagram accounts via the
-Instagram Login OAuth flow (separate from the Facebook Login path used
-by the existing ``InstagramProvider``).
+Supports Professional Instagram accounts (Business or Creator) via the
+Instagram Login OAuth flow — distinct from the Facebook-Login path used by
+``InstagramProvider``. No linked Facebook Page is required.
+
+Personal (non-Professional) Instagram accounts have no API access since
+the Basic Display API was retired on 2024-12-04. Users must convert their
+account to Professional before connecting.
 
 Docs: https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login
 """
@@ -34,22 +38,21 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
-AUTH_URL = "https://api.instagram.com/oauth/authorize"
+AUTH_URL = "https://www.instagram.com/oauth/authorize"
 TOKEN_URL = "https://api.instagram.com/oauth/access_token"
-API_BASE = "https://graph.instagram.com/v21.0"
+GRAPH_HOST = "https://graph.instagram.com"
+API_BASE = f"{GRAPH_HOST}/v21.0"
 
 # Container polling
 CONTAINER_POLL_INTERVAL = 2  # seconds
 CONTAINER_POLL_MAX_ATTEMPTS = 60  # ~2 minutes max
 
 
-class InstagramPersonalProvider(SocialProvider):
+class InstagramLoginProvider(SocialProvider):
     """Instagram API provider using Instagram Login (OAuth 2.0).
 
-    Unlike the standard ``InstagramProvider`` (which authenticates via
-    Facebook Login and requires a linked Facebook Page), this provider
-    uses Instagram's own OAuth flow and works with personal, creator,
-    and business accounts.
+    Authenticates Professional (Business or Creator) Instagram accounts
+    directly through Instagram, without requiring a linked Facebook Page.
     """
 
     def __init__(self, credentials: dict | None = None):
@@ -67,7 +70,7 @@ class InstagramPersonalProvider(SocialProvider):
 
     @property
     def platform_name(self) -> str:
-        return "Instagram (Personal)"
+        return "Instagram (Direct)"
 
     @property
     def auth_type(self) -> AuthType:
@@ -87,12 +90,21 @@ class InstagramPersonalProvider(SocialProvider):
 
     @property
     def required_scopes(self) -> list[str]:
-        return [
+        scopes = [
             "instagram_business_basic",
             "instagram_business_content_publish",
             "instagram_business_manage_comments",
             "instagram_business_manage_messages",
         ]
+        if self.include_analytics_scopes:
+            scopes.extend(self.analytics_only_scopes)
+        return scopes
+
+    @property
+    def analytics_only_scopes(self) -> list[str]:
+        # Required for `/insights` endpoints on the IG-Login OAuth path.
+        # Only requested when analytics is enabled in AnalyticsPlatformConfig.
+        return ["instagram_business_manage_insights"]
 
     @property
     def rate_limits(self) -> RateLimitConfig:
@@ -119,20 +131,29 @@ class InstagramPersonalProvider(SocialProvider):
         return f"{AUTH_URL}?{urlencode(params)}"
 
     def exchange_code(self, code: str, redirect_uri: str) -> OAuthTokens:
-        # Instagram Login requires form-encoded POST body
+        # Instagram Login requires multipart/form-data, not urlencoded.
+        fields = {
+            "client_id": self.credentials["client_id"],
+            "client_secret": self.credentials["client_secret"],
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+        }
         resp = self._request(
             "POST",
             TOKEN_URL,
-            data={
-                "client_id": self.credentials["client_id"],
-                "client_secret": self.credentials["client_secret"],
-                "code": code,
-                "grant_type": "authorization_code",
-                "redirect_uri": redirect_uri,
-            },
+            files={k: (None, v) for k, v in fields.items()},
         )
         body = resp.json()
         short_lived_token = body.get("access_token")
+        logger.info(
+            "IG-Login step 1: status=%s keys=%s user_id=%s token=%s len=%d",
+            resp.status_code,
+            sorted(body.keys()),
+            body.get("user_id"),
+            (short_lived_token[:6] + "...") if short_lived_token else None,
+            len(short_lived_token) if short_lived_token else 0,
+        )
         if not short_lived_token:
             raise OAuthError(
                 f"Instagram token exchange failed: {body}",
@@ -144,11 +165,19 @@ class InstagramPersonalProvider(SocialProvider):
         return self._exchange_for_long_lived_token(short_lived_token)
 
     def _exchange_for_long_lived_token(self, short_lived_token: str) -> OAuthTokens:
+        url = f"{GRAPH_HOST}/access_token"
+        logger.info(
+            "IG-Login step 2: GET %s client_id=%s token=%s",
+            url,
+            self.credentials.get("client_id"),
+            short_lived_token[:6] + "...",
+        )
         resp = self._request(
             "GET",
-            f"{API_BASE}/access_token",
+            url,
             params={
                 "grant_type": "ig_exchange_token",
+                "client_id": self.credentials["client_id"],
                 "client_secret": self.credentials["client_secret"],
                 "access_token": short_lived_token,
             },
@@ -178,7 +207,7 @@ class InstagramPersonalProvider(SocialProvider):
         """
         resp = self._request(
             "GET",
-            f"{API_BASE}/refresh_access_token",
+            f"{GRAPH_HOST}/refresh_access_token",
             params={
                 "grant_type": "ig_refresh_token",
                 "access_token": refresh_token,

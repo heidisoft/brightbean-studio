@@ -10,7 +10,7 @@ class PlatformCredential(models.Model):
     class Platform(models.TextChoices):
         FACEBOOK = "facebook", "Facebook"
         INSTAGRAM = "instagram", "Instagram"
-        INSTAGRAM_PERSONAL = "instagram_personal", "Instagram (Personal)"
+        INSTAGRAM_LOGIN = "instagram_login", "Instagram (Direct)"
         LINKEDIN_PERSONAL = "linkedin_personal", "LinkedIn (Personal Profile)"
         LINKEDIN_COMPANY = "linkedin_company", "LinkedIn (Company Page)"
         TIKTOK = "tiktok", "TikTok"

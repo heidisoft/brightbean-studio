@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from .base import SocialProvider
 from .exceptions import OAuthError, PublishError
 from .types import (
+    AccountMetrics,
     AccountProfile,
     AuthType,
     CommentResult,
@@ -30,6 +31,7 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 API_BASE = "https://www.googleapis.com/youtube/v3"
 UPLOAD_BASE = "https://www.googleapis.com/upload/youtube/v3"
+ANALYTICS_BASE = "https://youtubeanalytics.googleapis.com/v2"
 
 
 class YouTubeProvider(SocialProvider):
@@ -61,11 +63,21 @@ class YouTubeProvider(SocialProvider):
 
     @property
     def required_scopes(self) -> list[str]:
-        return [
+        scopes = [
             "https://www.googleapis.com/auth/youtube.upload",
             "https://www.googleapis.com/auth/youtube.readonly",
             "https://www.googleapis.com/auth/youtube.force-ssl",
         ]
+        if self.include_analytics_scopes:
+            scopes.extend(self.analytics_only_scopes)
+        return scopes
+
+    @property
+    def analytics_only_scopes(self) -> list[str]:
+        # Required for the YouTube Analytics API (watch time, retention,
+        # demographics). Only requested when analytics is enabled so the
+        # Google OAuth consent screen doesn't list it when not needed.
+        return ["https://www.googleapis.com/auth/yt-analytics.readonly"]
 
     @property
     def rate_limits(self) -> RateLimitConfig:
@@ -449,6 +461,72 @@ class YouTubeProvider(SocialProvider):
                 "favorite_count": int(stats.get("favoriteCount", 0)),
             },
         )
+
+    def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
+        """Channel-level metrics from the YouTube Analytics API.
+
+        Fetches the metrics the YouTube Data API can't provide per-video:
+        watch time, average view %, subscribers gained, and shares.
+        Views/likes/comments come from per-post snapshots so the main page
+        stays consistent with the per-post drawer; shares is the exception
+        because ``videos.list?part=statistics`` exposes no shareCount field.
+
+        Callers must pass a single-day ``date_range`` — Analytics returns one
+        aggregated row across [startDate, endDate], and the sync layer writes
+        it as a single day's snapshot. Larger ranges would silently collapse
+        into one cell.
+
+        Requires the ``yt-analytics.readonly`` scope. The YouTube Analytics
+        API typically lags 1–2 days behind real-time.
+        """
+        start_date = date_range[0].date().isoformat()
+        end_date = date_range[1].date().isoformat()
+        resp = self._request(
+            "GET",
+            f"{ANALYTICS_BASE}/reports",
+            access_token=access_token,
+            params={
+                "ids": "channel==MINE",
+                "startDate": start_date,
+                "endDate": end_date,
+                "metrics": "estimatedMinutesWatched,averageViewPercentage,subscribersGained,shares",
+            },
+        )
+        body = resp.json()
+        headers = body.get("columnHeaders", [])
+        rows = body.get("rows", [])
+        if not rows or not rows[0]:
+            return AccountMetrics()
+
+        index = {col.get("name", ""): i for i, col in enumerate(headers)}
+        row = rows[0]
+
+        def _value_or_none(name: str) -> float | None:
+            """Return float value if Analytics returned the column (even 0), else None.
+
+            Distinguishes "metric not in the response" (None) from "metric
+            returned 0" (0.0). Falsy-zero guards downstream incorrectly drop
+            real 0-value days otherwise.
+            """
+            i = index.get(name)
+            if i is None or i >= len(row) or row[i] is None:
+                return None
+            try:
+                return float(row[i])
+            except (TypeError, ValueError):
+                return None
+
+        extra: dict = {}
+        for api_key, catalog_key in (
+            ("estimatedMinutesWatched", "watch_time"),
+            ("averageViewPercentage", "avg_view_pct"),
+            ("subscribersGained", "subscribers"),
+            ("shares", "shares"),
+        ):
+            v = _value_or_none(api_key)
+            if v is not None:
+                extra[catalog_key] = v
+        return AccountMetrics(extra=extra)
 
     # ------------------------------------------------------------------
     # Token management

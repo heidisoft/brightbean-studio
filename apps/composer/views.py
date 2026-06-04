@@ -4,8 +4,8 @@ import contextlib
 import json
 import re
 import uuid
-import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
+from urllib.parse import urljoin
 
 import httpx
 from dateutil import parser as date_parser
@@ -20,6 +20,12 @@ from django.utils import timezone
 from django.utils.html import strip_tags
 from django.views.decorators.http import require_GET, require_POST
 
+from apps.common.validators import (
+    is_safe_url,
+    parse_and_truncate_tag_string,
+    parse_and_truncate_youtube_tag_string,
+    safe_xml_fromstring,
+)
 from apps.members.decorators import require_permission
 from apps.members.models import WorkspaceMembership
 from apps.social_accounts.models import SocialAccount
@@ -39,6 +45,8 @@ from .models import (
     PostVersion,
     Tag,
 )
+
+MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
 
 
 def _get_workspace(request, workspace_id):
@@ -88,8 +96,7 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
 
         # Per-platform extras
         if account.platform == "youtube":
-            tags_raw = request.POST.get(f"yt_tags_{acc_id}", "")
-            tags_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
+            tags_list = parse_and_truncate_youtube_tag_string(request.POST.get(f"yt_tags_{acc_id}", ""))
             privacy_status = request.POST.get(f"yt_privacy_status_{acc_id}", "public")
             if privacy_status not in ("public", "unlisted", "private"):
                 privacy_status = "public"
@@ -338,15 +345,16 @@ def compose(request, workspace_id, post_id=None):
         social_accounts = social_accounts.filter(id=account_filter)
 
     # Platform character limits for JS
-    char_limits = {
-        str(acc.id): {
+    char_limits = {}
+    for acc in social_accounts:
+        cfg = dict(acc.field_config)
+        cfg["supports_first_comment"] = acc.supports_first_comment()
+        char_limits[str(acc.id)] = {
             "platform": acc.platform,
             "limit": acc.char_limit,
             "name": acc.account_name or acc.account_handle,
-            **acc.field_config,
+            **cfg,
         }
-        for acc in social_accounts
-    }
 
     # Workspace defaults
     default_first_comment = workspace.default_first_comment
@@ -464,11 +472,10 @@ def compose(request, workspace_id, post_id=None):
         "form": form,
         "social_accounts": social_accounts,
         "selected_account_ids": [str(aid) for aid in selected_account_ids],
-        "platform_extras_json": json.dumps(platform_extras),
+        "platform_extras": platform_extras,
         "media_attachments": media_attachments,
         "media_items": media_items,
-        "media_items_json": json.dumps(media_items),
-        "char_limits_json": json.dumps(char_limits),
+        "char_limits": char_limits,
         "default_first_comment": default_first_comment,
         "default_hashtags": json.dumps(default_hashtags),
         "can_publish": can_publish,
@@ -863,9 +870,7 @@ def autosave(request, workspace_id, post_id=None):
     post.first_comment = request.POST.get("first_comment", "")
     post.internal_notes = request.POST.get("internal_notes", "")
 
-    tags_raw = request.POST.get("tags", "")
-    if tags_raw:
-        post.tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+    post.tags = parse_and_truncate_tag_string(request.POST.get("tags", ""))
 
     post.save()
 
@@ -1006,7 +1011,9 @@ def media_picker(request, workspace_id, post_id=None):
     if post_id:
         post = get_object_or_404(Post, id=post_id, workspace=workspace)
 
-    assets = MediaAsset.objects.for_workspace(workspace.id).order_by("-created_at")[:50]
+    assets = MediaAsset.objects.for_workspace_with_shared(workspace.id, workspace.organization_id).order_by(
+        "-created_at"
+    )[:50]
     return render(
         request,
         "composer/partials/media_picker.html",
@@ -1157,7 +1164,10 @@ def attach_media(request, workspace_id, post_id):
 
     from apps.media_library.models import MediaAsset
 
-    asset = get_object_or_404(MediaAsset, id=media_asset_id, workspace=workspace)
+    asset = get_object_or_404(
+        MediaAsset.objects.for_workspace_with_shared(workspace.id, workspace.organization_id),
+        id=media_asset_id,
+    )
 
     max_pos = post.media_attachments.aggregate(models.Max("position"))["position__max"]
     position = (max_pos or 0) + 1
@@ -1193,7 +1203,10 @@ def attach_pending_media(request, workspace_id):
 
     from apps.media_library.models import MediaAsset
 
-    asset = get_object_or_404(MediaAsset, id=media_asset_id, workspace=workspace)
+    asset = get_object_or_404(
+        MediaAsset.objects.for_workspace_with_shared(workspace.id, workspace.organization_id),
+        id=media_asset_id,
+    )
 
     session_key = f"pending_media_{workspace.id}"
     pending = request.session.get(session_key, [])
@@ -1353,7 +1366,7 @@ def remove_pending_media(request, workspace_id, asset_id):
 
     # Return updated pending list
     pending_assets = MediaAsset.objects.filter(id__in=pending, workspace=workspace)
-    return render(
+    response = render(
         request,
         "composer/partials/media_list_pending.html",
         {
@@ -1361,6 +1374,8 @@ def remove_pending_media(request, workspace_id, asset_id):
             "workspace": workspace,
         },
     )
+    response["HX-Trigger"] = "previewUpdate"
+    return response
 
 
 @login_required
@@ -1739,8 +1754,7 @@ def idea_create(request, workspace_id):
     workspace = _get_workspace(request, workspace_id)
     title = request.POST.get("title", "").strip()
     description = request.POST.get("description", "").strip()
-    tags_raw = request.POST.get("tags", "")
-    tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+    tags = parse_and_truncate_tag_string(request.POST.get("tags", ""))
 
     if not title:
         return HttpResponse("Title is required.", status=400)
@@ -1823,8 +1837,7 @@ def idea_edit(request, workspace_id, idea_id):
 
     idea.title = request.POST.get("title", idea.title).strip()
     idea.description = request.POST.get("description", idea.description).strip()
-    tags_raw = request.POST.get("tags", "")
-    idea.tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+    idea.tags = parse_and_truncate_tag_string(request.POST.get("tags", ""))
 
     group_id = request.POST.get("group", "").strip()
     if group_id:
@@ -2324,6 +2337,12 @@ def csv_upload(request, workspace_id):
         import io
 
         csv_file = request.FILES["csv_file"]
+        if csv_file.size and csv_file.size > MAX_CSV_UPLOAD_BYTES:
+            return render(
+                request,
+                "composer/csv_import.html",
+                {"workspace": workspace, "error": "CSV file too large (max 5 MB)."},
+            )
         decoded = csv_file.read().decode("utf-8-sig")
         reader = csv.reader(io.StringIO(decoded))
         rows = list(reader)
@@ -2365,8 +2384,6 @@ def csv_upload(request, workspace_id):
             "filename": csv_file.name,
         }
 
-        import json as json_mod
-
         return render(
             request,
             "composer/partials/csv_mapping.html",
@@ -2375,7 +2392,6 @@ def csv_upload(request, workspace_id):
                 "headers": headers,
                 "preview_rows": preview_rows,
                 "auto_mapping": auto_mapping,
-                "auto_mapping_json": json_mod.dumps(auto_mapping),
                 "field_choices": list(field_map.keys()),
             },
         )
@@ -2737,10 +2753,15 @@ def _parse_published_at(raw_value):
 
 
 def _parse_feed_document(xml_content):
-    """Parse RSS/Atom document into metadata and raw entries."""
-    try:
-        root = ET.fromstring(xml_content)
-    except ET.ParseError:
+    """Parse RSS/Atom document into metadata and raw entries.
+
+    Uses safe_xml_fromstring to bound size and reject DTD/entity-bearing
+    payloads (billion-laughs defence).
+    """
+    if isinstance(xml_content, str):
+        xml_content = xml_content.encode("utf-8", errors="replace")
+    root = safe_xml_fromstring(xml_content)
+    if root is None:
         return None
 
     root_name = _xml_local_name(root.tag)
@@ -2824,8 +2845,45 @@ def _build_event_from_entry(feed, parsed_feed, entry):
     }
 
 
+def _safe_fetch_feed(url, headers, *, timeout=8.0, max_redirects=5):
+    """Fetch *url* with manual redirect handling, re-validating each hop with
+    is_safe_url. Returns (response, final_url) on success or (None, None) on
+    any reject path (initial-URL failed SSRF check, intermediate hop failed
+    SSRF check, broken redirect, transport error).
+    """
+    if not is_safe_url(url):
+        return None, None
+    current_url = url
+    try:
+        response = httpx.get(current_url, headers=headers, timeout=timeout, follow_redirects=False)
+    except httpx.RequestError:
+        return None, None
+    for _ in range(max_redirects):
+        if response.status_code not in (301, 302, 303, 307, 308):
+            return response, current_url
+        location = response.headers.get("Location")
+        if not location:
+            return None, None
+        next_url = urljoin(current_url, location)
+        if not is_safe_url(next_url):
+            return None, None
+        try:
+            response = httpx.get(next_url, headers=headers, timeout=timeout, follow_redirects=False)
+        except httpx.RequestError:
+            return None, None
+        current_url = next_url
+    # Too many redirects.
+    return None, None
+
+
 def _fetch_feed_events_for_workspace(feeds):
-    """Fetch and aggregate recent events across all workspace feeds."""
+    """Fetch and aggregate recent events across all workspace feeds.
+
+    Each feed is re-validated against is_safe_url at fetch time (not just at
+    add time), and redirects are followed manually with per-hop SSRF checks.
+    This closes the DNS-rebind / redirect-bait window that would otherwise
+    let a previously-valid feed URL reach internal hosts on subsequent polls.
+    """
     if not feeds:
         return []
 
@@ -2834,17 +2892,15 @@ def _fetch_feed_events_for_workspace(feeds):
         "User-Agent": "Brightbean RSS Reader/1.0",
     }
     all_events = []
-    with httpx.Client(headers=headers, timeout=8.0, follow_redirects=True) as client:
-        for feed in feeds:
-            with contextlib.suppress(httpx.RequestError):
-                response = client.get(feed.url)
-                if response.status_code >= 400:
-                    continue
-                parsed_feed = _parse_feed_document(response.content)
-                if not parsed_feed:
-                    continue
-                for entry in parsed_feed["entries"][:50]:
-                    all_events.append(_build_event_from_entry(feed, parsed_feed, entry))
+    for feed in feeds:
+        response, _final_url = _safe_fetch_feed(feed.url, headers)
+        if response is None or response.status_code >= 400:
+            continue
+        parsed_feed = _parse_feed_document(response.content)
+        if not parsed_feed:
+            continue
+        for entry in parsed_feed["entries"][:50]:
+            all_events.append(_build_event_from_entry(feed, parsed_feed, entry))
 
     deduped_events = []
     seen = set()
@@ -2939,9 +2995,8 @@ def _validate_rss_url(rss_url):
         "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.1",
         "User-Agent": "Brightbean RSS Validator/1.0",
     }
-    try:
-        response = httpx.get(rss_url, headers=headers, timeout=8.0, follow_redirects=True)
-    except httpx.RequestError:
+    response, _final_url = _safe_fetch_feed(rss_url, headers)
+    if response is None:
         return False, "Could not reach this URL. Please check the link and try again.", {}
 
     if response.status_code >= 400:

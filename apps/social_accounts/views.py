@@ -23,7 +23,7 @@ from apps.common.validators import is_safe_url as _is_safe_url
 from apps.credentials.models import PlatformCredential
 from apps.members.decorators import require_permission
 
-from .models import MastodonAppRegistration, SocialAccount
+from .models import MastodonAppRegistration, PlatformVisibility, SocialAccount
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,31 @@ def _get_provider_for_platform(platform: str, org_id, **extra_credentials):
         credentials = {**credentials, **extra_credentials}
 
     return get_provider(platform, credentials)
+
+
+def _get_visible_platform_choices():
+    """Return PlatformCredential.Platform.choices filtered to visible platforms.
+
+    Platforms without a PlatformVisibility row default to visible.
+    """
+    hidden = set(PlatformVisibility.objects.filter(is_visible=False).values_list("platform", flat=True))
+    return [(value, label) for value, label in PlatformCredential.Platform.choices if value not in hidden]
+
+
+def _apply_analytics_scope_flag(provider, platform):
+    """Set ``provider.include_analytics_scopes`` based on AnalyticsPlatformConfig.
+
+    Providers add their analytics-only scopes (e.g. ``read_insights``,
+    ``yt-analytics.readonly``) to the OAuth scope list only when this flag is
+    True. If the platform is disabled in ``AnalyticsPlatformConfig`` (analytics
+    not yet rolled out for it), we omit those scopes so a self-hoster whose
+    Meta / TikTok / Google app hasn't been approved for them can still connect
+    accounts for publishing.
+    """
+    from apps.social_accounts.models import AnalyticsPlatformConfig
+
+    enabled = AnalyticsPlatformConfig.enabled_platforms()
+    provider.include_analytics_scopes = platform in enabled
 
 
 def _get_configured_platforms(org_id):
@@ -189,15 +214,13 @@ def account_list(request, workspace_id):
 # ------------------------------------------------------------------
 
 
-@csp_update(
-    FORM_ACTION="'self' https://accounts.google.com https://www.facebook.com https://api.instagram.com https://threads.net https://www.linkedin.com https://www.pinterest.com https://www.tiktok.com"
-)
 @login_required
 @require_permission("manage_social_accounts")
 @ratelimit(key="user", rate="20/m", method="POST", block=True)
 def connect_platform(request, workspace_id):
     """GET: show platform grid. POST: initiate OAuth flow."""
     configured_platforms = _get_configured_platforms(request.org.id)
+    visible_platform_choices = _get_visible_platform_choices()
 
     if request.method == "GET":
         return render(
@@ -205,15 +228,15 @@ def connect_platform(request, workspace_id):
             "social_accounts/connect.html",
             {
                 "workspace_id": workspace_id,
-                "platform_choices": PlatformCredential.Platform.choices,
+                "platform_choices": visible_platform_choices,
                 "configured_platforms": configured_platforms,
             },
         )
 
     # POST: initiate OAuth
     platform = request.POST.get("platform", "").strip()
-    if platform not in dict(PlatformCredential.Platform.choices):
-        messages.error(request, "Invalid platform selected.")
+    if platform not in dict(visible_platform_choices):
+        messages.error(request, "This platform is not available.")
         return redirect("social_accounts:connect", workspace_id=workspace_id)
 
     if platform not in configured_platforms:
@@ -231,6 +254,7 @@ def connect_platform(request, workspace_id):
 
     # Standard OAuth flow
     provider = _get_provider_for_platform(platform, request.org.id)
+    _apply_analytics_scope_flag(provider, platform)
     nonce = secrets.token_urlsafe(32)
     state = _sign_state(workspace_id, platform, request.user.id, nonce)
 
@@ -318,10 +342,11 @@ def oauth_callback(request, platform):
         tokens = provider.exchange_code(code, redirect_uri)
         profile = provider.get_profile(tokens.access_token)
 
-        # Facebook/Instagram: only connect Pages, not personal profiles
+        # Facebook/Instagram/LinkedIn Company: connect Pages, not personal profiles
         if platform in (
             PlatformCredential.Platform.FACEBOOK,
             PlatformCredential.Platform.INSTAGRAM,
+            PlatformCredential.Platform.LINKEDIN_COMPANY,
         ) and hasattr(provider, "get_user_pages"):
             pages = provider.get_user_pages(tokens.access_token)
             if pages:
@@ -337,15 +362,25 @@ def oauth_callback(request, platform):
                 }
                 return redirect("social_accounts:select_account")
             else:
-                messages.warning(
-                    request,
-                    "No Facebook Pages were found for your account. "
-                    "Only Pages can be connected — personal profiles are not "
-                    "supported by the Facebook API. "
-                    "If you expected to see a Page, make sure you have admin "
-                    "access and try removing the app in Facebook Settings \u2192 "
-                    "Business Integrations, then reconnect.",
-                )
+                if platform == PlatformCredential.Platform.LINKEDIN_COMPANY:
+                    warning = (
+                        "No LinkedIn Company Pages were found for your account. "
+                        "Only Company Pages you administer can be connected — "
+                        "personal profiles connect via the LinkedIn (Personal) option. "
+                        "If you expected to see a Page, ask the page owner to grant "
+                        "you Admin access in LinkedIn \u2192 Admin tools \u2192 "
+                        "Manage admins, then reconnect."
+                    )
+                else:
+                    warning = (
+                        "No Facebook Pages were found for your account. "
+                        "Only Pages can be connected — personal profiles are not "
+                        "supported by the Facebook API. "
+                        "If you expected to see a Page, make sure you have admin "
+                        "access and try removing the app in Facebook Settings \u2192 "
+                        "Business Integrations, then reconnect."
+                    )
+                messages.warning(request, warning)
                 return redirect("social_accounts:list", workspace_id=workspace_id)
 
         # Standard single-account flow (non-Facebook/Instagram platforms)
@@ -607,9 +642,6 @@ def connect_mastodon(request, workspace_id):
 # ------------------------------------------------------------------
 
 
-@csp_update(
-    FORM_ACTION="'self' https://accounts.google.com https://www.facebook.com https://api.instagram.com https://threads.net https://www.linkedin.com https://www.pinterest.com https://www.tiktok.com"
-)
 @login_required
 @require_permission("manage_social_accounts")
 @require_POST
@@ -625,6 +657,7 @@ def reconnect(request, workspace_id, account_id):
 
     # Standard OAuth reconnect
     provider = _get_provider_for_platform(platform, request.org.id)
+    _apply_analytics_scope_flag(provider, platform)
     nonce = secrets.token_urlsafe(32)
     state = _sign_state(workspace_id, platform, request.user.id, nonce)
 
@@ -725,6 +758,8 @@ def _create_or_update_account(
             "instance_url": instance_url,
             "connection_status": SocialAccount.ConnectionStatus.CONNECTED,
             "last_error": "",
+            # Fresh OAuth grant invalidates any prior analytics-scope failure.
+            "analytics_needs_reconnect": False,
         },
     )
 

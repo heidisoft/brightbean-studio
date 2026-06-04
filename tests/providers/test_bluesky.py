@@ -10,7 +10,10 @@ from providers.bluesky import BlueskyProvider, _access_jwt_expires_in
 
 def _make_jwt(payload: dict) -> str:
     """Build a JWT-shaped string (header.payload.signature) — signature is unchecked."""
-    encode = lambda obj: base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    def encode(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
     return f"{encode({'alg': 'HS256'})}.{encode(payload)}.signature"
 
 

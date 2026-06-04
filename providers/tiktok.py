@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from urllib.parse import urlencode
 
 from .base import SocialProvider
@@ -34,6 +35,15 @@ VALID_PRIVACY_LEVELS = frozenset(
     }
 )
 
+# TikTok FILE_UPLOAD's per-chunk limit is 64 MB decimal (not 64 MiB).
+# Anything larger requires multi-chunk upload, which we don't implement yet.
+MAX_SINGLE_CHUNK_SIZE = 64_000_000
+
+CONTENT_TYPE_BY_EXT = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+}
+
 
 class TikTokProvider(SocialProvider):
     """TikTok Content Posting API provider using OAuth 2.0."""
@@ -64,7 +74,23 @@ class TikTokProvider(SocialProvider):
 
     @property
     def required_scopes(self) -> list[str]:
-        return ["user.info.basic", "video.publish", "video.upload"]
+        scopes = [
+            "user.info.basic",
+            "video.publish",
+            "video.upload",
+        ]
+        if self.include_analytics_scopes:
+            scopes.extend(self.analytics_only_scopes)
+        return scopes
+
+    @property
+    def analytics_only_scopes(self) -> list[str]:
+        # ``video.list`` lets us read per-video stats; ``user.info.profile`` +
+        # ``user.info.stats`` enable account-level totals via /v2/user/info/.
+        # All three are gated behind the analytics platform toggle so a
+        # publish-only TikTok app (whose review hasn't approved them yet)
+        # can still connect accounts.
+        return ["user.info.profile", "user.info.stats", "video.list"]
 
     @property
     def rate_limits(self) -> RateLimitConfig:
@@ -182,13 +208,14 @@ class TikTokProvider(SocialProvider):
                 platform=self.platform_name,
             )
 
-        # Determine upload source strategy
-        if content.media_urls:
-            return self._publish_pull_from_url(access_token, content, privacy_level)
+        # Prefer FILE_UPLOAD: PULL_FROM_URL requires the source domain to be
+        # verified with TikTok, which presigned S3/R2 URLs can't satisfy.
         if content.media_files:
             return self._publish_file_upload(access_token, content, privacy_level)
+        if content.media_urls:
+            return self._publish_pull_from_url(access_token, content, privacy_level)
         raise PublishError(
-            "No video source provided (media_urls or media_files required)",
+            "No video source provided (media_files or media_urls required)",
             platform=self.platform_name,
         )
 
@@ -229,7 +256,20 @@ class TikTokProvider(SocialProvider):
         privacy_level: str,
     ) -> PublishResult:
         """Publish using FILE_UPLOAD source (two-step)."""
-        # Step 1: Initialize upload
+        video_path = content.media_files[0]
+        video_size = os.path.getsize(video_path)
+        if video_size > MAX_SINGLE_CHUNK_SIZE:
+            raise PublishError(
+                f"Video file is {video_size} bytes; TikTok single-chunk upload "
+                f"supports up to {MAX_SINGLE_CHUNK_SIZE} bytes. Multi-chunk upload "
+                "is not yet implemented.",
+                platform=self.platform_name,
+            )
+
+        ext = os.path.splitext(video_path)[1].lower()
+        content_type = CONTENT_TYPE_BY_EXT.get(ext, "video/mp4")
+
+        # Step 1: initialize upload with size metadata TikTok requires
         payload = {
             "post_info": {
                 "title": (content.title or content.text or "")[: self.max_caption_length],
@@ -237,6 +277,9 @@ class TikTokProvider(SocialProvider):
             },
             "source_info": {
                 "source": "FILE_UPLOAD",
+                "video_size": video_size,
+                "chunk_size": video_size,
+                "total_chunk_count": 1,
             },
         }
         init_resp = self._request(
@@ -256,19 +299,18 @@ class TikTokProvider(SocialProvider):
                 raw_response=init_body,
             )
 
-        # Step 2: Upload video binary
-        video_path = content.media_files[0]
+        # Step 2: stream the video binary to TikTok's presigned URL
         with open(video_path, "rb") as f:
-            video_data = f.read()
-
+            video_bytes = f.read()
         self._request(
             "PUT",
             upload_url,
             headers={
-                "Content-Type": "video/mp4",
-                "Content-Length": str(len(video_data)),
+                "Content-Type": content_type,
+                "Content-Length": str(video_size),
+                "Content-Range": f"bytes 0-{video_size - 1}/{video_size}",
             },
-            data=video_data,
+            data=video_bytes,
             timeout=120.0,
         )
 
