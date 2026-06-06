@@ -79,6 +79,7 @@ class InstagramProvider(SocialProvider):
     @property
     def required_scopes(self) -> list[str]:
         return [
+            "pages_show_list",
             "instagram_basic",
             "instagram_content_publish",
             "instagram_manage_comments",
@@ -180,6 +181,67 @@ class InstagramProvider(SocialProvider):
             follower_count=data.get("followers_count", 0),
             extra=data,
         )
+
+    # ------------------------------------------------------------------
+    # Linked Instagram accounts
+    # ------------------------------------------------------------------
+
+    def get_user_pages(self, access_token: str) -> list[dict]:
+        """Fetch Instagram business/creator accounts linked to Facebook Pages.
+
+        The social-account connection flow uses this method for any provider
+        that can expose multiple selectable accounts from one OAuth grant. For
+        Instagram Graph API, those selectable accounts are the Instagram
+        business/creator accounts linked to Pages the user can manage.
+        """
+        resp = self._request(
+            "GET",
+            f"{BASE_URL}/me/accounts",
+            access_token=access_token,
+            params={
+                "fields": (
+                    "id,name,access_token,category,picture,"
+                    "instagram_business_account{id,username,name,profile_picture_url,followers_count}"
+                )
+            },
+        )
+        data = resp.json()
+        if "error" in data:
+            logger.error("Instagram /me/accounts error: %s", data["error"])
+            raise APIError(
+                f"Failed to fetch Instagram accounts: {data['error'].get('message', 'Unknown error')}",
+                platform=self.platform_name,
+                raw_response=data,
+            )
+
+        accounts: list[dict] = []
+        for page in data.get("data", []):
+            ig_account = page.get("instagram_business_account")
+            if not ig_account:
+                continue
+
+            picture_url = ig_account.get("profile_picture_url")
+            if not picture_url and "picture" in page and "data" in page["picture"]:
+                picture_url = page["picture"]["data"].get("url")
+
+            username = ig_account.get("username")
+            display_name = ig_account.get("name") or username or page.get("name", "")
+            accounts.append(
+                {
+                    "id": ig_account["id"],
+                    "name": display_name,
+                    "handle": username,
+                    "access_token": page.get("access_token", access_token),
+                    "category": page.get("category", ""),
+                    "picture": picture_url,
+                    "followers_count": ig_account.get("followers_count", 0),
+                    "page_id": page.get("id"),
+                    "page_name": page.get("name", ""),
+                }
+            )
+
+        logger.debug("Instagram /me/accounts returned %d linked accounts", len(accounts))
+        return accounts
 
     # ------------------------------------------------------------------
     # Publishing (two-step container flow)
