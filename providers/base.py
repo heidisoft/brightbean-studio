@@ -93,6 +93,13 @@ class SocialProvider(ABC):
     # from the requested scope list. Default True keeps backward compat.
     include_analytics_scopes: bool = True
 
+    # True when ``get_account_metrics`` actually filters by the ``date_range``
+    # argument. Providers whose stats endpoint returns only lifetime totals
+    # (TikTok ``/v2/user/info/``) should set this to False so the sync layer
+    # doesn't replay the same cumulative values into multiple historical
+    # date rows on first sync.
+    account_metrics_supports_date_range: bool = True
+
     @property
     def rate_limits(self) -> RateLimitConfig:
         """Platform rate limit configuration."""

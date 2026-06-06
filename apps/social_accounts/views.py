@@ -24,6 +24,7 @@ from apps.credentials.models import PlatformCredential
 from apps.members.decorators import require_permission
 
 from .models import MastodonAppRegistration, PlatformVisibility, SocialAccount
+from .oauth_aliases import from_url_slug, redirect_uri_from_request, to_url_slug
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +101,17 @@ def _get_configured_platforms(org_id):
 
 
 def _build_redirect_uri(request, platform):
-    """Build the OAuth callback URL."""
+    """Build the OAuth callback URL.
+
+    Platforms with an entry in ``PLATFORM_TO_URL_ALIAS`` (currently only
+    TikTok → ``social1``) use the opaque slug in the URL path so the
+    redirect URI doesn't contain the platform brand name. The signed
+    OAuth state still carries the real platform identifier.
+    """
     from django.urls import reverse
 
-    return request.build_absolute_uri(reverse("social_accounts:oauth_callback", kwargs={"platform": platform}))
+    url_slug = to_url_slug(platform)
+    return request.build_absolute_uri(reverse("social_accounts:oauth_callback", kwargs={"platform": url_slug}))
 
 
 def _sign_state(workspace_id, platform, user_id, nonce):
@@ -279,7 +287,13 @@ def connect_platform(request, workspace_id):
 @ratelimit(key="user", rate="20/m", block=True)
 @require_GET
 def oauth_callback(request, platform):
-    """Handle OAuth callback from the platform."""
+    """Handle OAuth callback from the platform.
+
+    ``platform`` arrives as the URL slug, which may be an alias (e.g.
+    ``social1`` for TikTok). Normalise it before any platform-keyed lookup
+    or comparison against the signed state.
+    """
+    platform = from_url_slug(platform)
     error = request.GET.get("error")
     if error:
         error_desc = request.GET.get("error_description", error)
@@ -338,7 +352,7 @@ def oauth_callback(request, platform):
             extra_creds = _resolve_mastodon_extra_creds(session_data)
 
         provider = _get_provider_for_platform(platform, request.org.id, **extra_creds)
-        redirect_uri = _build_redirect_uri(request, platform)
+        redirect_uri = redirect_uri_from_request(request)
         tokens = provider.exchange_code(code, redirect_uri)
         profile = provider.get_profile(tokens.access_token)
 

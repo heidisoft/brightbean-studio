@@ -359,6 +359,8 @@ To connect social media accounts, you need API credentials from each platform's 
 
 For example, if your `APP_URL` is `https://brightbean.example.com`, the Facebook redirect URI would be `https://brightbean.example.com/social-accounts/callback/facebook/`.
 
+> **TikTok:** use the slug `social1` instead of `tiktok` — TikTok rejects redirect URIs containing their brand name. See the [TikTok](#tiktok) section.
+
 ### Meta (Facebook, Instagram, Threads)
 
 Facebook, Instagram, and Threads all use the same Meta app credentials.
@@ -471,9 +473,9 @@ If you set only the Path B (Company) credentials, Brightbean Studio automaticall
 
 1. Go to the [TikTok Developer Portal](https://developers.tiktok.com/) and create a new app
 2. Add the products **Login Kit** and **Content Posting API**
-3. Configure the redirect URI under your app's settings:
+3. Configure the redirect URI — use `social1`, not `tiktok` (TikTok rejects URIs containing their brand name):
    ```
-   {APP_URL}/social-accounts/callback/tiktok/
+   {APP_URL}/social-accounts/callback/social1/
    ```
 4. Required scopes: `user.info.basic`, `user.info.profile`, `user.info.stats`, `video.publish`, `video.upload`, `video.list`
 5. Note: TikTok uses **Client Key** (not Client ID). Copy the **Client Key** and **Client Secret** from your app dashboard
@@ -482,6 +484,7 @@ If you set only the Path B (Company) credentials, Brightbean Studio automaticall
    PLATFORM_TIKTOK_CLIENT_KEY=your-client-key
    PLATFORM_TIKTOK_CLIENT_SECRET=your-client-secret
    ```
+7. For production review, record the demo video against a TikTok **Sandbox** showing every requested scope in use.
 
 ### Google (YouTube, Google Business Profile)
 

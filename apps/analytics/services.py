@@ -414,15 +414,20 @@ def follower_growth_metric(
     """Same as :func:`follower_growth` but also returns the metric key.
 
     Returns ``(metric_key, derived)`` where ``metric_key`` is
-    ``"subscribers"`` on YouTube, ``"follows"`` elsewhere, and ``None``
+    ``"subscribers"`` on YouTube, ``"follows"`` for daily-delta platforms
+    (Instagram, Facebook, LinkedIn …), ``"followers"`` for platforms whose
+    API only exposes a cumulative lifetime total (TikTok), and ``None``
     on platforms without an account-level growth metric.
 
     Pass ``series_map`` to reuse an already-fetched
     :func:`account_analytics_bundle` result instead of issuing another
     per-metric query.
     """
+    # Mutually exclusive per platform — first-match-wins. ``derive`` handles
+    # both delta-style (``follows``/``subscribers``) and total-style
+    # (``followers``) series correctly because both are catalog kind="count".
     growth_metric = next(
-        (m for m in ("subscribers", "follows") if m in PLATFORM_METRICS.get(account.platform, [])),
+        (m for m in ("subscribers", "follows", "followers") if m in PLATFORM_METRICS.get(account.platform, [])),
         None,
     )
     if not growth_metric:

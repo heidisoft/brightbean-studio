@@ -189,12 +189,13 @@ def _post_metrics_to_dict(metrics, platform: str) -> dict[str, float]:
 def _account_metrics_to_dict(metrics, platform: str) -> dict[str, float]:
     """Flatten ``AccountMetrics`` into ``{metric_key: value}``.
 
-    ``platform`` is reserved for future per-platform tweaks (Facebook stashes
-    page_engaged_users in the ``reach`` field, etc.) but currently no platform
-    overrides are needed for the implemented account-level metrics. Kept
-    symmetric with ``_post_metrics_to_dict``.
+    ``platform`` gates per-platform persistence rules (e.g. ``followers``
+    is only persisted for platforms whose catalog lists it), so the
+    function asks ``apps.analytics.metrics.PLATFORM_METRICS`` rather than
+    writing every populated dataclass field for every platform.
     """
-    del platform  # currently unused but reserved
+    from .metrics import PLATFORM_METRICS
+
     out: dict[str, float] = {}
     for src, key in (
         ("impressions", "impressions"),
@@ -209,6 +210,14 @@ def _account_metrics_to_dict(metrics, platform: str) -> dict[str, float]:
     gained = getattr(metrics, "followers_gained", 0) or 0
     if gained:
         out["follows"] = float(gained)
+    # ``followers`` = current total follower count, persisted only when the
+    # platform's catalog lists ``followers`` (today: TikTok). Use ``is not
+    # None`` so brand-new accounts with 0 followers still get a baseline
+    # snapshot — the chart needs the zero day to render a continuous line.
+    if "followers" in PLATFORM_METRICS.get(platform, []):
+        total_followers = getattr(metrics, "followers", None)
+        if total_followers is not None:
+            out["followers"] = float(total_followers)
     extra = getattr(metrics, "extra", {}) or {}
     for key in ("views", "watch_time", "avg_view_pct", "subscribers", "likes", "comments", "shares"):
         v = extra.get(key)
@@ -321,6 +330,23 @@ def _write_post_snapshot(post, metric_values: dict[str, float], on_date: dt_date
 # API call when today is the only missing day.
 _ACCOUNT_METRICS_RECENT_DAYS = 3
 
+# Earliest plausible startDate for a YouTube Analytics ``/reports`` query —
+# YouTube launched 2005-02-14, so any channel's creation date is on or after
+# this. Used as the lower bound when fetching LIFETIME per-video metrics so
+# the values match what YouTube Studio shows (total watch time, etc.).
+_YOUTUBE_ANALYTICS_LIFETIME_START = dt_date(2005, 2, 14)
+
+# Per-platform metric keys whose ``PostInsightsSnapshot`` rows are written by
+# a sync path OTHER than the per-post Data-API ``_sync_post_metrics`` (e.g.,
+# the batched YouTube Analytics call in ``_sync_youtube_post_analytics``).
+# Excluding these from ``_post_cadence_due`` keeps the Analytics-only writes
+# — which can fire hourly during the 1–2 day Analytics-API lag — from
+# updating ``captured_at`` and starving the Data API of refreshes (the loop
+# would think every video was just synced and skip ``_sync_post_metrics``).
+_POST_NON_CADENCE_METRICS_BY_PLATFORM: dict[str, frozenset[str]] = {
+    "youtube": frozenset({"watch_time", "avg_view_pct", "shares"}),
+}
+
 
 def _sync_account_metrics(account, on_date: dt_date) -> None:
     """Fetch account-level metrics for ``on_date`` and any recent missing days.
@@ -329,6 +355,10 @@ def _sync_account_metrics(account, on_date: dt_date) -> None:
     skipping days that already have an :class:`AccountInsightsSnapshot`. For
     providers without lag (Instagram, Facebook) this is a no-op past
     ``on_date`` because the existing rows short-circuit the iteration.
+
+    For YouTube, also fetches per-video Analytics-API metrics (watch_time,
+    avg_view_pct, shares) that the Data API can't provide per-post — see
+    :func:`_sync_youtube_post_analytics`.
     """
     from datetime import datetime, time
 
@@ -336,7 +366,13 @@ def _sync_account_metrics(account, on_date: dt_date) -> None:
 
     provider = _resolve_provider(account)
     tz = timezone.get_current_timezone()
-    for offset in range(_ACCOUNT_METRICS_RECENT_DAYS):
+    # Providers whose stats endpoint returns only lifetime totals (TikTok)
+    # must NOT have those totals written into past dates as if they were
+    # historical observations — that fabricates fake history. Run only the
+    # current day for them; backfill of true historical values is impossible
+    # without an API that supports it.
+    recent_days = _ACCOUNT_METRICS_RECENT_DAYS if getattr(provider, "account_metrics_supports_date_range", True) else 1
+    for offset in range(recent_days):
         target = on_date - timedelta(days=offset)
         if AccountInsightsSnapshot.objects.filter(social_account=account, date=target).exists():
             continue
@@ -352,6 +388,69 @@ def _sync_account_metrics(account, on_date: dt_date) -> None:
             logger.warning("get_account_metrics failed for %s on %s: %s", account, target, exc)
             return
         _write_account_snapshot(account, _account_metrics_to_dict(metrics, account.platform), target)
+
+    if account.platform == "youtube":
+        _sync_youtube_post_analytics(account, provider, on_date)
+
+
+def _sync_youtube_post_analytics(account, provider, on_date: dt_date) -> None:
+    """Snapshot lifetime per-video YouTube Analytics metrics for ``on_date``.
+
+    Bridges the gap between the YouTube Data API (which exposes per-video
+    views/likes/comments via ``videos.list?part=statistics``) and the
+    Analytics API (which exposes ``watch_time``, ``avg_view_pct``, and
+    ``shares`` per video via ``/reports?dimensions=video``). One batched
+    Analytics request covers every published video on the channel, so
+    quota cost is independent of post count up to the 500-video filter cap.
+
+    Stores LIFETIME values keyed by ``on_date`` so the per-post table shows
+    totals (matching what YouTube Studio shows), and so the chart fallback
+    (:func:`apps.analytics.services._post_summed_series_for_metric`) can
+    compute day-over-day deltas across consecutive snapshots — same
+    cumulative-snapshot semantics as views/likes/comments.
+    """
+    from datetime import datetime, time
+
+    from apps.composer.models import PlatformPost
+
+    post_ids = list(
+        PlatformPost.objects.filter(
+            social_account=account,
+            status=PlatformPost.Status.PUBLISHED,
+            published_at__date__lte=on_date,
+        )
+        .exclude(platform_post_id="")
+        .values_list("platform_post_id", flat=True)
+    )
+    if not post_ids:
+        return
+
+    tz = timezone.get_current_timezone()
+    start = datetime.combine(_YOUTUBE_ANALYTICS_LIFETIME_START, time.min, tzinfo=tz)
+    end = datetime.combine(on_date, time.max, tzinfo=tz)
+
+    try:
+        per_video = provider.get_post_analytics(account.oauth_access_token, post_ids, (start, end))
+    except NotImplementedError:
+        return
+    except Exception as exc:
+        if _is_insufficient_scope(exc):
+            _mark_needs_reconnect(account)
+        logger.warning("get_post_analytics failed for %s on %s: %s", account, on_date, exc)
+        return
+
+    if not per_video:
+        return
+
+    posts_by_pid = {
+        p.platform_post_id: p
+        for p in PlatformPost.objects.filter(social_account=account, platform_post_id__in=list(per_video.keys()))
+    }
+    for pid, metrics in per_video.items():
+        post = posts_by_pid.get(pid)
+        if post is None:
+            continue
+        _write_post_snapshot(post, _post_metrics_to_dict(metrics, "youtube"), on_date)
 
 
 def _sync_post_metrics(post, on_date: dt_date) -> None:
@@ -377,8 +476,20 @@ def _mark_needs_reconnect(account):
     account.save(update_fields=["analytics_needs_reconnect", "updated_at"])
 
 
-def _post_cadence_due(post, now=None) -> bool:
-    """Decide whether ``post`` is due for a new sync per the decay schedule."""
+def _post_cadence_due(post, now=None, *, platform: str | None = None) -> bool:
+    """Decide whether ``post`` is due for a new ``_sync_post_metrics`` sync.
+
+    Looks at the latest ``PostInsightsSnapshot.captured_at`` for ``post`` and
+    compares it against the decay schedule. Excludes the platform-specific
+    Analytics-only metric keys listed in
+    :data:`_POST_NON_CADENCE_METRICS_BY_PLATFORM` so a snapshot written by a
+    different sync path (the batched YouTube per-video Analytics fetch in
+    :func:`_sync_youtube_post_analytics`) doesn't reset the cadence and
+    starve the Data-API loop of refreshes.
+
+    ``platform`` may be supplied by callers iterating posts of a known
+    account to avoid the implicit ``post.social_account.platform`` lookup.
+    """
     from .models import PostInsightsSnapshot
 
     now = now or timezone.now()
@@ -387,12 +498,12 @@ def _post_cadence_due(post, now=None) -> bool:
     cadence = post_sync_interval(now - post.published_at)
     if cadence is None:
         return False  # past the 90-day horizon.
-    last = (
-        PostInsightsSnapshot.objects.filter(platform_post=post)
-        .order_by("-captured_at")
-        .values_list("captured_at", flat=True)
-        .first()
-    )
+    qs = PostInsightsSnapshot.objects.filter(platform_post=post)
+    platform = platform or post.social_account.platform
+    excluded = _POST_NON_CADENCE_METRICS_BY_PLATFORM.get(platform)
+    if excluded:
+        qs = qs.exclude(metric_key__in=excluded)
+    last = qs.order_by("-captured_at").values_list("captured_at", flat=True).first()
     if last is None:
         return True
     return (now - last) >= cadence
@@ -477,5 +588,5 @@ def sync_all_account_analytics() -> None:
             published_at__gte=cutoff,
         ).exclude(platform_post_id="")
         for post in posts:
-            if _post_cadence_due(post):
+            if _post_cadence_due(post, platform=account.platform):
                 _sync_post_metrics(post, today)

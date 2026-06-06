@@ -24,6 +24,7 @@ METRICS: dict[str, dict[str, str]] = {
     "outbound": {"label": "Outbound clicks", "kind": "count"},
     "profile_visits": {"label": "Profile visits", "kind": "count"},
     "follows": {"label": "New follows", "kind": "count"},
+    "followers": {"label": "Followers", "kind": "count"},
     "subscribers": {"label": "Subscribers", "kind": "count"},
     "watch_time": {"label": "Watch time", "kind": "minutes"},
     "avg_view_pct": {"label": "Avg view %", "kind": "percent"},
@@ -33,7 +34,7 @@ METRICS: dict[str, dict[str, str]] = {
 # Metrics that exist for the account/channel but never per individual post
 # (you can't attribute new followers to one post via the platform APIs).
 # These appear in account summaries but not in the per-post table.
-ACCOUNT_ONLY: set[str] = {"follows", "subscribers"}
+ACCOUNT_ONLY: set[str] = {"follows", "followers", "subscribers"}
 
 # Which metrics each platform's API reports (after the scope upgrades in the
 # plan are in place). Verified against each platform's published insights API.
@@ -50,8 +51,14 @@ PLATFORM_METRICS: dict[str, list[str]] = {
     "linkedin_personal": ["likes", "comments", "shares"],
     # YouTube Analytics: views, watch_time, avg_view_pct, likes, comments, shares, subscribers gained.
     "youtube": ["views", "watch_time", "avg_view_pct", "likes", "comments", "shares", "subscribers"],
-    # TikTok video metrics: video_views, likes, comments, shares, watch_time (no per-post saves).
-    "tiktok": ["views", "likes", "comments", "shares", "watch_time", "follows", "engagement"],
+    # TikTok video metrics: view/like/comment/share counts from /v2/video/query/.
+    # ``followers`` (total) is account-only — TikTok's /v2/user/info/ returns
+    # cumulative counters with no daily delta, so we surface the total rather
+    # than ``follows`` (which is defined as "new follows" per day). watch_time
+    # is intentionally absent: /v2/video/query/ doesn't expose it per-video
+    # and TikTok has no public per-video Analytics-style endpoint yet — listing
+    # it would render an always-zero chart and mislead users.
+    "tiktok": ["views", "likes", "comments", "shares", "followers", "engagement"],
     # Bluesky / AT Protocol post aggregates: like, repost, reply counts (no impressions/views).
     "bluesky": ["likes", "reposts", "replies", "follows"],
     # Threads insights: views, likes, replies, reposts; account follower growth.
