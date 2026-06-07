@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import logging
 import re
 import uuid
 from datetime import UTC, datetime
@@ -47,6 +48,8 @@ from .models import (
 )
 
 MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
+
+logger = logging.getLogger(__name__)
 
 
 def _get_workspace(request, workspace_id):
@@ -535,6 +538,15 @@ def _delete_remote_platform_posts(platform_posts):
             provider.delete_post(pp.social_account.oauth_access_token, pp.platform_post_id)
         except Exception as exc:
             account_name = pp.social_account.account_name or pp.social_account.account_handle
+            logger.warning(
+                "Remote delete failed for PlatformPost %s on %s account %s (%s), remote id %s: %s",
+                pp.id,
+                pp.social_account.platform,
+                pp.social_account_id,
+                account_name,
+                pp.platform_post_id,
+                exc,
+            )
             errors.append(
                 f"{account_name} ({pp.social_account.get_platform_display()}): {exc}"
             )
