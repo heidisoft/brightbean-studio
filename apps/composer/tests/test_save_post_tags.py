@@ -283,6 +283,31 @@ class PublishedPostDeleteTests(TestCase):
         self.assertTrue(PlatformPost.objects.filter(id=pp.id).exists())
         self.assertIn("remote unavailable", response.json()["errors"]["delete"][0])
 
+    @patch("providers.instagram.InstagramProvider._request")
+    def test_unsupported_instagram_remote_delete_does_not_block_local_delete(self, mock_request):
+        post, pp, _account = self._make_published_post("instagram")
+
+        response = self.client.post(self._delete_url(post), data={"delete_remote": "true"})
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Post.objects.filter(id=post.id).exists())
+        self.assertFalse(PlatformPost.objects.filter(id=pp.id).exists())
+        mock_request.assert_not_called()
+
+    def test_delete_dialog_marks_instagram_remote_delete_unsupported(self):
+        post, _pp, _account = self._make_published_post("instagram")
+        edit_url = reverse(
+            "composer:compose_edit",
+            kwargs={"workspace_id": self.workspace.id, "post_id": post.id},
+        )
+
+        response = self.client.get(edit_url)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode("utf-8")
+        self.assertIn("Remote delete is not supported for:", body)
+        self.assertIn("Instagram", body)
+
     @patch("providers.facebook.FacebookProvider._request")
     def test_delete_single_platform_post_deletes_only_that_remote_target(self, mock_request):
         response_mock = MagicMock()

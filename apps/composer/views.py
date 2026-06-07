@@ -51,6 +51,8 @@ MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
 
 logger = logging.getLogger(__name__)
 
+REMOTE_DELETE_UNSUPPORTED_PLATFORMS = {"instagram", "instagram_login"}
+
 
 def _get_workspace(request, workspace_id):
     """Resolve workspace and enforce membership check."""
@@ -491,6 +493,7 @@ def compose(request, workspace_id, post_id=None):
         "workflow_mode": workflow_mode,
         "show_submit_button": show_submit_button,
         "show_resubmit_button": show_resubmit_button,
+        "remote_delete_summary": _remote_delete_summary(post),
         "approval_history": approval_history,
         "post_comments": post_comments,
         "pending_assets": pending_assets,
@@ -544,6 +547,26 @@ def _platform_status_map(post):
     return {str(pp.id): pp.status for pp in post.platform_posts.all()}
 
 
+def _remote_delete_summary(post):
+    """Build delete capability text for the post editor modal."""
+    if not post:
+        return {"supported": [], "unsupported": []}
+
+    supported = []
+    unsupported = []
+    for pp in post.platform_posts.select_related("social_account").filter(
+        status=PlatformPost.Status.PUBLISHED,
+    ):
+        account = pp.social_account
+        name = account.account_name or account.account_handle or account.get_platform_display()
+        label = f"{name} ({account.get_platform_display()})"
+        if account.platform in REMOTE_DELETE_UNSUPPORTED_PLATFORMS:
+            unsupported.append(label)
+        elif pp.platform_post_id:
+            supported.append(label)
+    return {"supported": supported, "unsupported": unsupported}
+
+
 def _delete_remote_platform_posts(platform_posts):
     """Delete remote posts for local PlatformPosts that already published."""
     from apps.publisher.engine import _resolve_publish_credentials
@@ -553,12 +576,32 @@ def _delete_remote_platform_posts(platform_posts):
     for pp in platform_posts:
         if not pp.platform_post_id:
             continue
+        account_name = pp.social_account.account_name or pp.social_account.account_handle
+        if pp.social_account.platform in REMOTE_DELETE_UNSUPPORTED_PLATFORMS:
+            logger.info(
+                "Remote delete skipped for PlatformPost %s on %s account %s (%s), remote id %s: unsupported platform",
+                pp.id,
+                pp.social_account.platform,
+                pp.social_account_id,
+                account_name,
+                pp.platform_post_id,
+            )
+            continue
         try:
             credentials = _resolve_publish_credentials(pp.social_account)
             provider = get_provider(pp.social_account.platform, credentials)
             provider.delete_post(pp.social_account.oauth_access_token, pp.platform_post_id)
+        except NotImplementedError as exc:
+            logger.info(
+                "Remote delete skipped for PlatformPost %s on %s account %s (%s), remote id %s: %s",
+                pp.id,
+                pp.social_account.platform,
+                pp.social_account_id,
+                account_name,
+                pp.platform_post_id,
+                exc,
+            )
         except Exception as exc:
-            account_name = pp.social_account.account_name or pp.social_account.account_handle
             logger.warning(
                 "Remote delete failed for PlatformPost %s on %s account %s (%s), remote id %s: %s",
                 pp.id,

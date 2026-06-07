@@ -377,17 +377,10 @@ class InstagramProvider(SocialProvider):
         )
 
     def delete_post(self, access_token: str, post_id: str) -> bool:
-        if not post_id:
-            raise PublishError(
-                "post_id is required for Instagram media deletion",
-                platform=self.platform_name,
-            )
-        self._request(
-            "DELETE",
-            f"{BASE_URL}/{post_id}",
-            access_token=access_token,
+        raise NotImplementedError(
+            "Instagram does not support deleting already-published media through the Graph API."
         )
-        return True
+
 
     # ------------------------------------------------------------------
     # Comments
