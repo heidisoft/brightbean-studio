@@ -131,3 +131,52 @@ class SmtpCredential(models.Model):
             "use_ssl": bool(data.get("use_ssl", False)),
             "timeout": int(data.get("timeout") or 10),
         }
+
+
+class SmtpTestLog(models.Model):
+    """Audit trail for SMTP test email attempts."""
+
+    class Status(models.TextChoices):
+        SUCCESS = "success", "Success"
+        FAILURE = "failure", "Failure"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="smtp_test_logs",
+    )
+    smtp_credential = models.ForeignKey(
+        SmtpCredential,
+        on_delete=models.SET_NULL,
+        related_name="test_logs",
+        blank=True,
+        null=True,
+    )
+    created_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.SET_NULL,
+        related_name="smtp_test_logs",
+        blank=True,
+        null=True,
+    )
+    recipient_email = models.EmailField()
+    from_email = models.EmailField()
+    host = models.CharField(max_length=255)
+    port = models.PositiveIntegerField(default=587)
+    status = models.CharField(max_length=20, choices=Status.choices)
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = OrgScopedManager()
+
+    class Meta:
+        db_table = "credentials_smtp_test_log"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["organization", "created_at"], name="idx_smtp_log_org_time"),
+            models.Index(fields=["status", "created_at"], name="idx_smtp_log_status"),
+        ]
+
+    def __str__(self):
+        return f"SMTP test {self.status} to {self.recipient_email}"

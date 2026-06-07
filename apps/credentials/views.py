@@ -11,7 +11,7 @@ from apps.members.decorators import require_org_role
 from apps.members.models import OrgMembership
 
 from .forms import SmtpCredentialForm
-from .models import PlatformCredential, SmtpCredential
+from .models import PlatformCredential, SmtpCredential, SmtpTestLog
 
 
 PLATFORM_FIELDS = {
@@ -209,6 +209,21 @@ def _send_smtp_test_email(request, credential):
     msg.send(fail_silently=False)
 
 
+def _create_smtp_test_log(request, credential, *, status, error=""):
+    data = credential.credentials or {}
+    return SmtpTestLog.objects.create(
+        organization=request.org,
+        smtp_credential=credential,
+        created_by=request.user,
+        recipient_email=request.user.email,
+        from_email=data.get("from_email", ""),
+        host=data.get("host", ""),
+        port=int(data.get("port") or 587),
+        status=status,
+        error=error,
+    )
+
+
 def _platform_rows(org):
     existing = {c.platform: c for c in PlatformCredential.objects.filter(organization=org)}
     rows = []
@@ -230,6 +245,19 @@ def _platform_rows(org):
 @login_required
 @require_org_role("admin")
 def credentials_list(request):
+    return render(
+        request,
+        "credentials/list.html",
+        {
+            "platforms": _platform_rows(request.org),
+            "settings_active": "credentials",
+        },
+    )
+
+
+@login_required
+@require_org_role("admin")
+def smtp_settings(request):
     credential = SmtpCredential.objects.filter(organization=request.org).first()
 
     if request.method == "POST":
@@ -244,27 +272,34 @@ def credentials_list(request):
                     credential.tested_at = timezone.now()
                     credential.last_error = str(exc)
                     credential.save(update_fields=["test_result", "tested_at", "last_error", "updated_at"])
+                    _create_smtp_test_log(
+                        request,
+                        credential,
+                        status=SmtpTestLog.Status.FAILURE,
+                        error=str(exc),
+                    )
                     messages.error(request, "SMTP settings were saved, but the test email failed.")
                 else:
                     credential.test_result = SmtpCredential.TestResult.SUCCESS
                     credential.tested_at = timezone.now()
                     credential.last_error = ""
                     credential.save(update_fields=["test_result", "tested_at", "last_error", "updated_at"])
+                    _create_smtp_test_log(request, credential, status=SmtpTestLog.Status.SUCCESS)
                     messages.success(request, f"SMTP settings saved. Test email sent to {request.user.email}.")
             else:
                 messages.success(request, "SMTP settings saved.")
-            return redirect("credentials:list")
+            return redirect("credentials:smtp")
     else:
         form = SmtpCredentialForm(initial=_initial_smtp_data(credential))
 
     return render(
         request,
-        "credentials/list.html",
+        "credentials/smtp.html",
         {
             "form": form,
             "smtp_credential": credential,
-            "platforms": _platform_rows(request.org),
-            "settings_active": "credentials",
+            "smtp_logs": SmtpTestLog.objects.filter(organization=request.org).select_related("created_by")[:20],
+            "settings_active": "smtp",
         },
     )
 
