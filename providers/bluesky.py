@@ -272,6 +272,34 @@ class BlueskyProvider(SocialProvider):
             extra=data,
         )
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        """Delete a Bluesky post from its AT URI."""
+        if not post_id:
+            raise PublishError(
+                "post_id is required for Bluesky post deletion",
+                platform=self.platform_name,
+            )
+        parts = post_id.split("/")
+        if len(parts) < 5 or parts[0] != "at:":
+            raise PublishError(
+                f"Invalid Bluesky post URI: {post_id}",
+                platform=self.platform_name,
+            )
+        repo = parts[2]
+        collection = parts[3]
+        rkey = parts[4]
+        self._request(
+            "POST",
+            f"{self.pds_url}/xrpc/com.atproto.repo.deleteRecord",
+            access_token=access_token,
+            json={
+                "repo": repo,
+                "collection": collection,
+                "rkey": rkey,
+            },
+        )
+        return True
+
     # ------------------------------------------------------------------
     # Rich text facet parsing
     # ------------------------------------------------------------------

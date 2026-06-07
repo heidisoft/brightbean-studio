@@ -328,6 +328,26 @@ class TikTokProvider(SocialProvider):
             extra=init_body.get("data", {}),
         )
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        if not post_id:
+            raise PublishError(
+                "post_id is required for TikTok video deletion",
+                platform=self.platform_name,
+            )
+        video_id = self._resolve_video_id(access_token, post_id)
+        if not video_id:
+            raise PublishError(
+                "TikTok publish has not resolved to a deletable video ID yet",
+                platform=self.platform_name,
+            )
+        self._request(
+            "POST",
+            f"{API_BASE}/video/delete/",
+            access_token=access_token,
+            json={"video_id": video_id},
+        )
+        return True
+
     # ------------------------------------------------------------------
     # Analytics
     # ------------------------------------------------------------------

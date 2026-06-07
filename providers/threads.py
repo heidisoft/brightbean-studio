@@ -273,6 +273,19 @@ class ThreadsProvider(SocialProvider):
             extra=publish_body,
         )
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        if not post_id:
+            raise PublishError(
+                "post_id is required for Threads deletion",
+                platform=self.platform_name,
+            )
+        self._request(
+            "DELETE",
+            f"{API_BASE}/{post_id}",
+            access_token=access_token,
+        )
+        return True
+
     def _publish_carousel(
         self,
         access_token: str,

@@ -4,6 +4,8 @@ Verifies that excess tags are silently truncated and that XSS payloads survive
 to storage and render escaped.
 """
 
+from unittest.mock import MagicMock, patch
+
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
@@ -185,3 +187,128 @@ class YouTubePlatformTagsTests(TestCase):
         total = sum(len(t) for t in stored_tags) + max(0, len(stored_tags) - 1)
         self.assertLessEqual(total, MAX_YT_TAGS_TOTAL_CHARS)
         self.assertGreater(len(stored_tags), 0)
+
+
+class PublishedPostDeleteTests(TestCase):
+    """Deleting in Studio should delete the remote published post first."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="owner@example.com",
+            password="testpass123",
+            tos_accepted_at=timezone.now(),
+        )
+        self.org = Organization.objects.create(name="Test Org")
+        self.workspace = Workspace.objects.create(organization=self.org, name="Test Workspace")
+        OrgMembership.objects.create(
+            user=self.user,
+            organization=self.org,
+            org_role=OrgMembership.OrgRole.OWNER,
+        )
+        WorkspaceMembership.objects.create(
+            user=self.user,
+            workspace=self.workspace,
+            workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
+        )
+        self.client.force_login(self.user)
+
+    def _make_published_post(self, platform):
+        account = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform=platform,
+            account_platform_id=f"{platform}-acct-1",
+            account_name=f"{platform.title()} Account",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        post = Post.objects.create(
+            workspace=self.workspace,
+            author=self.user,
+            title="Original title",
+            caption="Original caption",
+            published_at=timezone.now(),
+        )
+        pp = PlatformPost.objects.create(
+            post=post,
+            social_account=account,
+            status=PlatformPost.Status.PUBLISHED,
+            platform_post_id=f"{platform}-remote-old",
+            published_at=timezone.now(),
+            publish_error="Previous transient error",
+        )
+        return post, pp, account
+
+    def _delete_url(self, post):
+        return reverse(
+            "composer:post_delete",
+            kwargs={"workspace_id": self.workspace.id, "post_id": post.id},
+        )
+
+    @patch("providers.facebook.FacebookProvider._request")
+    def test_delete_published_post_defaults_to_local_only(self, mock_request):
+        post, pp, _account = self._make_published_post("facebook")
+
+        response = self.client.post(self._delete_url(post))
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Post.objects.filter(id=post.id).exists())
+        self.assertFalse(PlatformPost.objects.filter(id=pp.id).exists())
+        mock_request.assert_not_called()
+
+    @patch("providers.facebook.FacebookProvider._request")
+    def test_delete_published_facebook_post_deletes_remote_when_requested(self, mock_request):
+        response_mock = MagicMock()
+        response_mock.json.return_value = {"success": True}
+        mock_request.return_value = response_mock
+        post, pp, _account = self._make_published_post("facebook")
+
+        response = self.client.post(self._delete_url(post), data={"delete_remote": "true"})
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Post.objects.filter(id=post.id).exists())
+        self.assertFalse(PlatformPost.objects.filter(id=pp.id).exists())
+        args, kwargs = mock_request.call_args
+        self.assertEqual(args[0], "DELETE")
+        self.assertTrue(args[1].endswith("/facebook-remote-old"))
+        self.assertEqual(kwargs["access_token"], "")
+
+    @patch("providers.facebook.FacebookProvider._request")
+    def test_remote_delete_failure_keeps_local_post_for_retry(self, mock_request):
+        mock_request.side_effect = RuntimeError("remote unavailable")
+        post, pp, _account = self._make_published_post("facebook")
+
+        response = self.client.post(self._delete_url(post), data={"delete_remote": "true"})
+
+        self.assertEqual(response.status_code, 502)
+        self.assertTrue(Post.objects.filter(id=post.id).exists())
+        self.assertTrue(PlatformPost.objects.filter(id=pp.id).exists())
+        self.assertIn("remote unavailable", response.json()["errors"]["delete"][0])
+
+    @patch("providers.facebook.FacebookProvider._request")
+    def test_delete_single_platform_post_deletes_only_that_remote_target(self, mock_request):
+        response_mock = MagicMock()
+        response_mock.json.return_value = {"success": True}
+        mock_request.return_value = response_mock
+        post, pp, account = self._make_published_post("facebook")
+        other_account = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform="mastodon",
+            account_platform_id="mastodon-acct-1",
+            account_name="Mastodon Account",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        other_pp = PlatformPost.objects.create(
+            post=post,
+            social_account=other_account,
+            status=PlatformPost.Status.DRAFT,
+        )
+        url = reverse(
+            "composer:post_delete",
+            kwargs={"workspace_id": self.workspace.id, "post_id": post.id},
+        )
+
+        response = self.client.post(f"{url}?account={account.id}", data={"delete_remote": "true"})
+
+        self.assertEqual(response.status_code, 204)
+        self.assertTrue(Post.objects.filter(id=post.id).exists())
+        self.assertFalse(PlatformPost.objects.filter(id=pp.id).exists())
+        self.assertTrue(PlatformPost.objects.filter(id=other_pp.id).exists())

@@ -520,6 +520,27 @@ def _platform_status_map(post):
     return {str(pp.id): pp.status for pp in post.platform_posts.all()}
 
 
+def _delete_remote_platform_posts(platform_posts):
+    """Delete remote posts for local PlatformPosts that already published."""
+    from apps.publisher.engine import _resolve_publish_credentials
+    from providers import get_provider
+
+    errors = []
+    for pp in platform_posts:
+        if not pp.platform_post_id:
+            continue
+        try:
+            credentials = _resolve_publish_credentials(pp.social_account)
+            provider = get_provider(pp.social_account.platform, credentials)
+            provider.delete_post(pp.social_account.oauth_access_token, pp.platform_post_id)
+        except Exception as exc:
+            account_name = pp.social_account.account_name or pp.social_account.account_handle
+            errors.append(
+                f"{account_name} ({pp.social_account.get_platform_display()}): {exc}"
+            )
+    return errors
+
+
 @login_required
 @require_permission("create_posts")
 @require_POST
@@ -1408,13 +1429,27 @@ def post_delete(request, workspace_id, post_id):
     post = get_object_or_404(Post, id=post_id, workspace=workspace)
 
     account_id = request.GET.get("account") or request.POST.get("account")
+    delete_remote = request.POST.get("delete_remote") == "true"
     if account_id:
-        pp = get_object_or_404(PlatformPost, post=post, social_account_id=account_id)
+        pp = get_object_or_404(
+            PlatformPost.objects.select_related("social_account"),
+            post=post,
+            social_account_id=account_id,
+        )
+        if delete_remote:
+            remote_errors = _delete_remote_platform_posts([pp])
+            if remote_errors:
+                return JsonResponse({"errors": {"delete": remote_errors}}, status=502)
         pp.delete()
         # If no platform posts remain, clean up the parent post too.
         if not post.platform_posts.exists():
             post.delete()
     else:
+        if delete_remote:
+            platform_posts = list(post.platform_posts.select_related("social_account"))
+            remote_errors = _delete_remote_platform_posts(platform_posts)
+            if remote_errors:
+                return JsonResponse({"errors": {"delete": remote_errors}}, status=502)
         post.delete()
 
     return HttpResponse(

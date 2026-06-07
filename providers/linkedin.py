@@ -225,6 +225,20 @@ class LinkedInProvider(SocialProvider):
             return self._publish_poll_post(access_token, author, content)
         return self._publish_text_post(access_token, author, content)
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        if not post_id:
+            raise PublishError(
+                "post_id is required for LinkedIn post deletion",
+                platform=self.platform_name,
+            )
+        self._request(
+            "DELETE",
+            f"{API_BASE}/rest/posts/{quote(post_id, safe='')}",
+            access_token=access_token,
+            headers=LINKEDIN_HEADERS,
+        )
+        return True
+
     def _build_post_body(self, author: str, commentary: str) -> dict:
         return {
             "author": author,
