@@ -299,6 +299,20 @@ class FacebookProvider(SocialProvider):
             extra=data,
         )
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        """Delete an existing Facebook Page post/photo/video."""
+        if not post_id:
+            raise PublishError(
+                "post_id is required for Facebook post deletion",
+                platform=self.platform_name,
+            )
+        self._request(
+            "DELETE",
+            f"{BASE_URL}/{post_id}",
+            access_token=access_token,
+        )
+        return True
+
     # ------------------------------------------------------------------
     # Comments
     # ------------------------------------------------------------------

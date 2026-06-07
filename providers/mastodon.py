@@ -272,6 +272,19 @@ class MastodonProvider(SocialProvider):
             extra=data,
         )
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        if not post_id:
+            raise PublishError(
+                "post_id is required for Mastodon status deletion",
+                platform=self.platform_name,
+            )
+        self._request(
+            "DELETE",
+            f"{self.instance_url}/api/v1/statuses/{post_id}",
+            access_token=access_token,
+        )
+        return True
+
     def publish_comment(self, access_token: str, post_id: str, text: str) -> CommentResult:
         """Reply to an existing Mastodon status."""
         resp = self._request(
