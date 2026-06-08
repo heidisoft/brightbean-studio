@@ -1,13 +1,16 @@
 """Tests for the Content Calendar app (T-1A.2)."""
 
-from datetime import time
+from datetime import datetime, time
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
 from apps.accounts.models import User
-from apps.calendar.models import PostingSlot
+from apps.calendar.models import PostingSlot, Queue
+from apps.composer.models import PlatformPost, Post
 from apps.members.models import OrgMembership, WorkspaceMembership
 from apps.organizations.models import Organization
 from apps.social_accounts.models import SocialAccount
@@ -40,6 +43,40 @@ class PostingSlotModelTest(TestCase):
         slot = PostingSlot()
         slot.day_of_week = 4
         self.assertEqual(slot.day_name, "Friday")
+
+
+class QueueSchedulingServiceTests(TestCase):
+    """Queue slots should be materialized as workspace-local publish times."""
+
+    def test_assign_queue_slots_uses_workspace_timezone_wall_clock(self):
+        from apps.calendar.services import add_to_queue
+
+        eastern = ZoneInfo("America/New_York")
+        org = Organization.objects.create(name="Org", default_timezone="America/New_York")
+        workspace = Workspace.objects.create(organization=org, name="Workspace")
+        account = SocialAccount.objects.create(
+            workspace=workspace,
+            platform="instagram",
+            account_platform_id="ig-1",
+            account_name="Instagram",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        queue = Queue.objects.create(workspace=workspace, social_account=account, name="Instagram Queue")
+        PostingSlot.objects.create(social_account=account, day_of_week=0, time=time(9, 0))
+        post = Post.objects.create(workspace=workspace, caption="Queued")
+        platform_post = PlatformPost.objects.create(post=post, social_account=account, status="draft")
+
+        now_utc = datetime(2026, 6, 8, 8, 0, tzinfo=ZoneInfo("UTC"))
+        with patch("apps.calendar.services.timezone.now", return_value=now_utc):
+            add_to_queue(post, queue)
+
+        platform_post.refresh_from_db()
+        local_scheduled = platform_post.scheduled_at.astimezone(eastern)
+
+        self.assertEqual(local_scheduled.weekday(), 0)
+        self.assertEqual(local_scheduled.hour, 9)
+        self.assertEqual(local_scheduled.minute, 0)
+        self.assertEqual(platform_post.scheduled_at.astimezone(ZoneInfo("UTC")).hour, 13)
 
 
 class PostingSlotCrossWorkspaceTests(TestCase):

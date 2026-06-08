@@ -1,6 +1,7 @@
 """Queue scheduling services for the Content Calendar (F-2.3)."""
 
 from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.db import models
 from django.utils import timezone
@@ -44,10 +45,22 @@ def _next_slot_datetimes(social_account, after_dt, count=30):
 
     Starting from `after_dt`, walks forward through the week to find
     upcoming slot times based on the account's PostingSlot configuration.
+    PostingSlot.time is a workspace-local wall-clock time, so all slot
+    datetimes are built in the workspace timezone before Django stores them.
     """
     slots = PostingSlot.objects.filter(social_account=social_account, is_active=True).order_by("day_of_week", "time")
     if not slots.exists():
         return []
+
+    workspace_tz_name = getattr(social_account.workspace, "effective_timezone", None) or "UTC"
+    try:
+        workspace_tz = ZoneInfo(workspace_tz_name)
+    except ZoneInfoNotFoundError:
+        workspace_tz = ZoneInfo("UTC")
+
+    if timezone.is_naive(after_dt):
+        after_dt = timezone.make_aware(after_dt, workspace_tz)
+    after_dt = after_dt.astimezone(workspace_tz)
 
     slot_list = list(slots)
     results = []
@@ -62,9 +75,7 @@ def _next_slot_datetimes(social_account, after_dt, count=30):
             if slot.day_of_week != weekday:
                 continue
 
-            slot_dt = datetime.combine(check_date, slot.time)
-            if after_dt.tzinfo:
-                slot_dt = slot_dt.replace(tzinfo=after_dt.tzinfo)
+            slot_dt = datetime.combine(check_date, slot.time, tzinfo=workspace_tz)
 
             if slot_dt <= after_dt:
                 continue
