@@ -4,7 +4,12 @@ Context: media_attachments, post, workspace.
 {% endcomment %}
 
 {% for attachment in media_attachments %}
-<div class="media-thumb" draggable="true">
+<div class="media-thumb"
+     draggable="true"
+     data-media-type="{{ attachment.media_asset.media_type }}"
+     data-file-size="{{ attachment.media_asset.file_size }}"
+     data-file-size-display="{{ attachment.media_asset.file_size_display }}"
+     data-filename="{{ attachment.media_asset.filename }}">
     {% if attachment.media_asset.is_video %}
     <video src="{{ attachment.media_asset.file.url }}#t=0.5" class="w-full h-full object-cover" muted preload="metadata"></video>
     <div class="absolute inset-0 flex items-center justify-center pointer-events-none">

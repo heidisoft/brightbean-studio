@@ -28,6 +28,7 @@ from apps.common.validators import (
 )
 from apps.members.decorators import require_permission
 from apps.members.models import WorkspaceMembership
+from apps.social_accounts.media_limits import format_bytes, get_media_upload_limit
 from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
 
@@ -48,6 +49,22 @@ from .models import (
 
 MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
 
+<<<<<<< Updated upstream
+=======
+logger = logging.getLogger(__name__)
+
+REMOTE_DELETE_UNSUPPORTED_PLATFORMS = {"instagram", "instagram_login"}
+
+PUBLISH_MEDIA_ACTIONS = {
+    "schedule",
+    "publish_now",
+    "add_to_queue",
+    "add_to_queue_priority",
+    "submit_for_approval",
+    "resubmit_for_approval",
+}
+
+>>>>>>> Stashed changes
 
 def _get_workspace(request, workspace_id):
     """Resolve workspace and enforce membership check."""
@@ -120,6 +137,44 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
             }
 
         pp.save()
+
+
+def _media_size_validation_errors(accounts, media_assets):
+    """Return user-facing errors for media too large for selected providers."""
+    errors = []
+    for asset in media_assets:
+        media_type = "video" if asset.is_video else "image" if asset.is_image else None
+        if media_type is None:
+            continue
+        for account in accounts:
+            limit = get_media_upload_limit(account.platform, media_type)
+            if limit is None or asset.file_size <= limit:
+                continue
+            account_name = account.account_name or account.account_handle or account.get_platform_display()
+            errors.append(
+                f"{asset.filename} is {asset.file_size_display}, but {account_name} "
+                f"({account.get_platform_display()}) allows {format_bytes(limit)} for {media_type} uploads. "
+                f"Do not upload it to that provider until you resize or compress it."
+            )
+    return errors
+
+
+def _selected_accounts_for_request(request, workspace):
+    selected_ids_str = request.POST.get("selected_accounts", "")
+    selected_ids = [s.strip() for s in selected_ids_str.split(",") if s.strip()]
+    if not selected_ids:
+        return SocialAccount.objects.none()
+    return SocialAccount.objects.filter(id__in=selected_ids, workspace=workspace)
+
+
+def _pending_assets_for_request(request, workspace):
+    from apps.media_library.models import MediaAsset
+
+    session_key = f"pending_media_{workspace.id}"
+    pending_ids = request.session.get(session_key, [])
+    if not pending_ids:
+        return MediaAsset.objects.none()
+    return MediaAsset.objects.filter(id__in=pending_ids, workspace=workspace)
 
 
 def _save_version(post, user):
@@ -353,6 +408,10 @@ def compose(request, workspace_id, post_id=None):
             "platform": acc.platform,
             "limit": acc.char_limit,
             "name": acc.account_name or acc.account_handle,
+            "media_limits": {
+                "image": get_media_upload_limit(acc.platform, "image"),
+                "video": get_media_upload_limit(acc.platform, "video"),
+            },
             **cfg,
         }
 
@@ -408,6 +467,9 @@ def compose(request, workspace_id, post_id=None):
                 "url": asset.file.url if asset.file else "",
                 "is_video": asset.is_video,
                 "filename": asset.filename,
+                "media_type": asset.media_type,
+                "file_size": asset.file_size,
+                "file_size_display": asset.file_size_display,
             }
         )
     if not media_items:
@@ -417,6 +479,9 @@ def compose(request, workspace_id, post_id=None):
                     "url": asset.file.url if asset.file else "",
                     "is_video": asset.is_video,
                     "filename": asset.filename,
+                    "media_type": asset.media_type,
+                    "file_size": asset.file_size,
+                    "file_size_display": asset.file_size_display,
                 }
             )
 
@@ -541,6 +606,18 @@ def save_post(request, workspace_id, post_id=None):
 
     if not form.is_valid():
         return JsonResponse({"errors": form.errors}, status=400)
+
+    if action in PUBLISH_MEDIA_ACTIONS:
+        selected_accounts = _selected_accounts_for_request(request, workspace)
+        media_assets = list(_pending_assets_for_request(request, workspace))
+        if post_id:
+            media_assets.extend(
+                att.media_asset
+                for att in post.media_attachments.select_related("media_asset").all()
+            )
+        media_errors = _media_size_validation_errors(selected_accounts, media_assets)
+        if media_errors:
+            return JsonResponse({"errors": {"media": media_errors}}, status=400)
 
     post = form.save(commit=False)
     post.workspace = workspace

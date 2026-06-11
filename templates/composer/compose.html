@@ -298,6 +298,7 @@
               hx-post="{% if post %}{% url 'composer:save_post_edit' workspace_id=workspace.id post_id=post.id %}{% else %}{% url 'composer:save_post' workspace_id=workspace.id %}{% endif %}"
               hx-swap="none"
               @htmx:after-request="onFormSaved($event)"
+              @submit="if (!canSubmitWithMedia($event)) $event.preventDefault()"
               class="flex flex-col flex-1 min-h-0">
             <input type="hidden" name="selected_accounts" :value="selectedAccounts.join(',')">
 
@@ -423,6 +424,21 @@
                             {% elif pending_assets %}
                                 {% include "composer/partials/media_list_pending.html" %}
                             {% endif %}
+                        </div>
+
+                        <div x-show="mediaLimitWarnings.length > 0" x-cloak
+                             class="mx-4 mb-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                            <div class="flex items-start gap-2">
+                                <svg class="w-4 h-4 flex-shrink-0 mt-0.5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m0 3.75h.008v.008H12V16.5zm-9.303 2.25h18.606L12 2.25 2.697 18.75z"/></svg>
+                                <div class="space-y-1 min-w-0">
+                                    <p class="font-semibold">Resize or compress before publishing.</p>
+                                    <template x-for="warning in mediaLimitWarnings.slice(0, 3)" :key="warning">
+                                        <p x-text="warning"></p>
+                                    </template>
+                                    <p x-show="mediaLimitWarnings.length > 3"
+                                       x-text="'+' + (mediaLimitWarnings.length - 3) + ' more media size warning' + (mediaLimitWarnings.length - 3 === 1 ? '' : 's')"></p>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- Inline media dropzone -->
@@ -1395,6 +1411,7 @@ function composerApp() {
         previewTimer: null,
         autosavedPostId: '{{ post.id|default:"" }}',
         mediaItems: JSON.parse(document.getElementById('composer-media-items').textContent),
+        mediaWarningTick: 0,
 
         // Computed-like getters for title field visibility
         get anyPlatformNeedsTitle() {
@@ -1427,6 +1444,26 @@ function composerApp() {
             if (!this.caption) return '';
             const firstLine = this.caption.split('\n')[0] || '';
             return firstLine.substring(0, 100);
+        },
+        get mediaLimitWarnings() {
+            this.mediaWarningTick;
+            const warnings = [];
+            const seen = new Set();
+            const items = this.collectAttachedMediaItems();
+            for (const item of items) {
+                const mediaType = item.media_type === 'video' || item.is_video ? 'video' : 'image';
+                if (!['image', 'video'].includes(mediaType)) continue;
+                for (const accId of this.selectedAccounts) {
+                    const cfg = this.charLimits[accId] || {};
+                    const limit = cfg.media_limits?.[mediaType];
+                    if (!limit || item.file_size <= limit) continue;
+                    const key = `${item.filename}:${accId}:${mediaType}:${limit}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    warnings.push(`${item.filename} is ${item.file_size_display || this.formatBytes(item.file_size)}, but ${cfg.name || cfg.platform} allows ${this.formatBytes(limit)} for ${mediaType} uploads. Do not upload it to that provider until you resize or compress it.`);
+                }
+            }
+            return warnings;
         },
 
         platformIconSvg(platform) {
@@ -1496,6 +1533,13 @@ function composerApp() {
                     this.uploadUrl = `/workspace/{{ workspace.id }}/compose/${detail.postId}/upload-media/`;
                 }
             });
+
+            document.body.addEventListener('htmx:afterSwap', (e) => {
+                if (e.detail && e.detail.target && e.detail.target.id === 'media-list') {
+                    this.refreshMediaWarnings();
+                }
+            });
+            this.refreshMediaWarnings();
         },
 
         toggleAccount(id) {
@@ -1513,6 +1557,7 @@ function composerApp() {
             // Wait for Alpine to flush :value bindings before triggering HTMX
             this.$nextTick(() => {
                 this.triggerPreviewUpdate();
+                this.refreshMediaWarnings();
             });
         },
 
@@ -1622,6 +1667,62 @@ function composerApp() {
 
         uploadUrl: '{% if post %}{% url "composer:upload_media_post" workspace_id=workspace.id post_id=post.id %}{% else %}{% url "composer:upload_media" workspace_id=workspace.id %}{% endif %}',
 
+        formatBytes(size) {
+            let value = Number(size || 0);
+            if (value >= 1000000 && value % 1000000 === 0) {
+                return `${value / 1000000} MB`;
+            }
+            const units = ['B', 'KB', 'MB', 'GB'];
+            for (const unit of units) {
+                if (value < 1024 || unit === 'GB') {
+                    if (unit === 'B') return `${Math.round(value)} ${unit}`;
+                    return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
+                }
+                value = value / 1024;
+            }
+            return `${value.toFixed(1)} GB`;
+        },
+
+        collectAttachedMediaItems() {
+            const nodes = Array.from(document.querySelectorAll('#media-list .media-thumb[data-file-size]'));
+            if (nodes.length > 0) {
+                return nodes.map(node => ({
+                    media_type: node.dataset.mediaType || 'image',
+                    is_video: node.dataset.mediaType === 'video',
+                    file_size: Number(node.dataset.fileSize || 0),
+                    file_size_display: node.dataset.fileSizeDisplay || '',
+                    filename: node.dataset.filename || 'Attached media',
+                }));
+            }
+            return this.mediaItems || [];
+        },
+
+        providerMediaWarningsForFile(file) {
+            const mediaType = file.type.startsWith('video/') ? 'video' : 'image';
+            if (!['image', 'video'].includes(mediaType)) return [];
+            return this.selectedAccounts
+                .map(accId => {
+                    const cfg = this.charLimits[accId] || {};
+                    const limit = cfg.media_limits?.[mediaType];
+                    if (!limit || file.size <= limit) return null;
+                    return `${file.name} is ${this.formatBytes(file.size)}, but ${cfg.name || cfg.platform} allows ${this.formatBytes(limit)} for ${mediaType} uploads. Resize or compress it before uploading to that provider.`;
+                })
+                .filter(Boolean);
+        },
+
+        refreshMediaWarnings() {
+            this.mediaWarningTick++;
+        },
+
+        canSubmitWithMedia(event) {
+            const action = event.submitter?.value || '';
+            const publishActions = ['schedule', 'publish_now', 'add_to_queue', 'add_to_queue_priority', 'submit_for_approval', 'resubmit_for_approval'];
+            if (!publishActions.includes(action) || this.mediaLimitWarnings.length === 0) return true;
+            this.formError = this.mediaLimitWarnings[0];
+            setTimeout(() => { this.formError = ''; }, 7000);
+            return false;
+        },
+
         handleFileDrop(event) {
             const files = event.dataTransfer.files;
             if (files.length > 0) {
@@ -1655,6 +1756,12 @@ function composerApp() {
             }
 
             for (const file of files) {
+                const warnings = this.providerMediaWarningsForFile(file);
+                if (warnings.length > 0) {
+                    this.formError = warnings[0];
+                    setTimeout(() => { this.formError = ''; }, 7000);
+                    continue;
+                }
                 this.uploadQueue.push(file);
             }
             this._processQueue();
@@ -1754,6 +1861,7 @@ function composerApp() {
                         }
                     }
                     document.body.dispatchEvent(new CustomEvent('previewUpdate'));
+                    self.refreshMediaWarnings();
                 } else {
                     self._showUploadError(thumb, file);
                 }

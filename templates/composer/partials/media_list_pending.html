@@ -4,7 +4,11 @@ Context: pending_assets, workspace.
 {% endcomment %}
 
 {% for asset in pending_assets %}
-<div class="media-thumb">
+<div class="media-thumb"
+     data-media-type="{{ asset.media_type }}"
+     data-file-size="{{ asset.file_size }}"
+     data-file-size-display="{{ asset.file_size_display }}"
+     data-filename="{{ asset.filename }}">
     {% if asset.is_video %}
     <video src="{{ asset.file.url }}#t=0.5" class="w-full h-full object-cover" muted preload="metadata"></video>
     <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
