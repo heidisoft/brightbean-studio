@@ -99,7 +99,15 @@ def assign_queue_slots(queue):
     """
     from apps.composer.services import sync_post_scheduled_at
 
-    entries = queue.entries.select_related("post").order_by("position")
+    terminal_statuses = ["published", "failed"]
+    entries = (
+        queue.entries.select_related("post")
+        .exclude(
+            post__platform_posts__social_account=queue.social_account,
+            post__platform_posts__status__in=terminal_statuses,
+        )
+        .order_by("position")
+    )
     if not entries.exists():
         return
 
