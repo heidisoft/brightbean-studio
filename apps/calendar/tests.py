@@ -1,13 +1,16 @@
 """Tests for the Content Calendar app (T-1A.2)."""
 
-from datetime import time
+from datetime import datetime, time, timedelta
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
 from apps.accounts.models import User
-from apps.calendar.models import PostingSlot
+from apps.calendar.models import PostingSlot, Queue, QueueEntry
+from apps.composer.models import PlatformPost, Post
 from apps.members.models import OrgMembership, WorkspaceMembership
 from apps.organizations.models import Organization
 from apps.social_accounts.models import SocialAccount
@@ -40,6 +43,133 @@ class PostingSlotModelTest(TestCase):
         slot = PostingSlot()
         slot.day_of_week = 4
         self.assertEqual(slot.day_name, "Friday")
+
+
+class QueueSchedulingServiceTests(TestCase):
+    """Queue slots should only rewrite active queued platform posts."""
+
+    def test_assign_queue_slots_does_not_move_published_platform_posts(self):
+        from apps.calendar.services import add_to_queue
+
+        org = Organization.objects.create(name="Org", default_timezone="UTC")
+        workspace = Workspace.objects.create(organization=org, name="Workspace")
+        account = SocialAccount.objects.create(
+            workspace=workspace,
+            platform="instagram",
+            account_platform_id="ig-1",
+            account_name="Instagram",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        queue = Queue.objects.create(workspace=workspace, social_account=account, name="Instagram Queue")
+        PostingSlot.objects.create(social_account=account, day_of_week=0, time=time(9, 0))
+
+        original_scheduled_at = datetime(2026, 6, 1, 9, 0, tzinfo=ZoneInfo("UTC"))
+        original_published_at = datetime(2026, 6, 1, 9, 5, tzinfo=ZoneInfo("UTC"))
+        published_post = Post.objects.create(
+            workspace=workspace,
+            caption="Already sent",
+            scheduled_at=original_scheduled_at,
+            published_at=original_published_at,
+        )
+        published_platform_post = PlatformPost.objects.create(
+            post=published_post,
+            social_account=account,
+            status=PlatformPost.Status.PUBLISHED,
+            scheduled_at=original_scheduled_at,
+            published_at=original_published_at,
+        )
+        QueueEntry.objects.create(
+            queue=queue,
+            post=published_post,
+            position=0,
+            assigned_slot_datetime=original_scheduled_at,
+        )
+
+        new_post = Post.objects.create(workspace=workspace, caption="New queued post")
+        new_platform_post = PlatformPost.objects.create(
+            post=new_post,
+            social_account=account,
+            status=PlatformPost.Status.DRAFT,
+        )
+
+        now_utc = datetime(2026, 6, 8, 8, 0, tzinfo=ZoneInfo("UTC"))
+        with patch("apps.calendar.services.timezone.now", return_value=now_utc):
+            add_to_queue(new_post, queue)
+
+        published_post.refresh_from_db()
+        published_platform_post.refresh_from_db()
+        new_platform_post.refresh_from_db()
+
+        self.assertEqual(published_post.scheduled_at, original_scheduled_at)
+        self.assertEqual(published_post.published_at, original_published_at)
+        self.assertEqual(published_platform_post.scheduled_at, original_scheduled_at)
+        self.assertEqual(published_platform_post.published_at, original_published_at)
+        self.assertEqual(new_platform_post.scheduled_at, datetime(2026, 6, 8, 9, 0, tzinfo=ZoneInfo("UTC")))
+
+
+class PublishSentTabTests(TestCase):
+    """The Sent tab should be driven by published time, not mutable schedule time."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="owner@example.com",
+            password="testpass123",
+            tos_accepted_at=timezone.now(),
+        )
+        self.org = Organization.objects.create(name="Org", default_timezone="UTC")
+        self.workspace = Workspace.objects.create(organization=self.org, name="Workspace")
+        WorkspaceMembership.objects.create(
+            user=self.user,
+            workspace=self.workspace,
+            workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
+        )
+        self.account = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform="instagram",
+            account_platform_id="ig-1",
+            account_name="Instagram",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+
+    def test_sent_tab_orders_by_platform_published_at(self):
+        older_published_at = timezone.now() - timedelta(days=2)
+        newer_published_at = timezone.now() - timedelta(hours=2)
+
+        older_post = Post.objects.create(
+            workspace=self.workspace,
+            author=self.user,
+            caption="Older actual publish",
+            scheduled_at=timezone.now() + timedelta(days=30),
+            published_at=older_published_at,
+        )
+        newer_post = Post.objects.create(
+            workspace=self.workspace,
+            author=self.user,
+            caption="Newer actual publish",
+            scheduled_at=timezone.now() - timedelta(days=30),
+            published_at=newer_published_at,
+        )
+        PlatformPost.objects.create(
+            post=older_post,
+            social_account=self.account,
+            status=PlatformPost.Status.PUBLISHED,
+            scheduled_at=older_post.scheduled_at,
+            published_at=older_published_at,
+        )
+        PlatformPost.objects.create(
+            post=newer_post,
+            social_account=self.account,
+            status=PlatformPost.Status.PUBLISHED,
+            scheduled_at=newer_post.scheduled_at,
+            published_at=newer_published_at,
+        )
+
+        self.client.force_login(self.user)
+        response = self.client.get(reverse("calendar:publish_tab_sent", kwargs={"workspace_id": self.workspace.id}))
+
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode()
+        self.assertLess(body.index("Newer actual publish"), body.index("Older actual publish"))
 
 
 class PostingSlotCrossWorkspaceTests(TestCase):

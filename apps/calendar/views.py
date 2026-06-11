@@ -309,7 +309,8 @@ def _get_tab_context(request, workspace, tab: str) -> dict:
             )
             .select_related("post__author", "social_account")
             .prefetch_related("post__media_attachments__media_asset")
-            .order_by("-post__scheduled_at", "-post__created_at")
+            .annotate(sent_at=Coalesce("published_at", "scheduled_at", "post__scheduled_at"))
+            .order_by("-sent_at", "-post__created_at")
         )
         platform_posts = _apply_pp_publish_filters(platform_posts, request)
         return {**base_ctx, "platform_posts": platform_posts[:200]}
