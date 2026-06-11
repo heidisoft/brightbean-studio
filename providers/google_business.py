@@ -285,6 +285,19 @@ class GoogleBusinessProvider(SocialProvider):
             extra=data,
         )
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        if not post_id:
+            raise PublishError(
+                "post_id is required for Google Business post deletion",
+                platform=self.platform_name,
+            )
+        self._request(
+            "DELETE",
+            f"{POSTS_API}/{post_id}",
+            access_token=access_token,
+        )
+        return True
+
     # ------------------------------------------------------------------
     # Analytics
     # ------------------------------------------------------------------
