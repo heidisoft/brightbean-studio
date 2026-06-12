@@ -297,8 +297,23 @@ class QueueSlotAssignmentTests(TestCase):
     """Regression tests for per-account next available slot assignment."""
 
     def setUp(self):
+        self.user = User.objects.create_user(
+            email="owner@example.com",
+            password="testpass123",
+            tos_accepted_at=timezone.now(),
+        )
         self.org = Organization.objects.create(name="Org")
         self.workspace = Workspace.objects.create(organization=self.org, name="Workspace")
+        OrgMembership.objects.create(
+            user=self.user,
+            organization=self.org,
+            org_role=OrgMembership.OrgRole.OWNER,
+        )
+        WorkspaceMembership.objects.create(
+            user=self.user,
+            workspace=self.workspace,
+            workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
+        )
         self.account_a = SocialAccount.objects.create(
             workspace=self.workspace,
             platform="facebook",
@@ -440,6 +455,37 @@ class QueueSlotAssignmentTests(TestCase):
 
         queued_platform_post = queued_post.platform_posts.get(social_account=self.account_a)
         self.assertEqual(queued_platform_post.scheduled_at, self.first_slot)
+
+    def test_updating_posting_slot_reassigns_existing_queue_entries(self):
+        queued_post = self._post_for_accounts(self.account_a)
+        add_to_queue(queued_post, self.queue_a)
+
+        platform_post = queued_post.platform_posts.get(social_account=self.account_a)
+        self.assertEqual(platform_post.scheduled_at, self.first_slot)
+
+        slot = PostingSlot.objects.get(
+            social_account=self.account_a,
+            day_of_week=self.first_slot.weekday(),
+            time=self.first_slot.time(),
+        )
+        new_time = time(10, 30)
+        expected = datetime.combine(self.first_slot.date(), new_time).replace(tzinfo=self.first_slot.tzinfo)
+
+        self.client.force_login(self.user)
+        response = self.client.post(
+            reverse(
+                "calendar:update_posting_slot",
+                kwargs={"workspace_id": self.workspace.id, "slot_id": slot.id},
+            ),
+            data={"time": new_time.strftime("%H:%M")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        platform_post.refresh_from_db()
+        queued_post.refresh_from_db()
+        self.assertEqual(platform_post.scheduled_at, expected)
+        self.assertEqual(queued_post.queue_entries.get(queue=self.queue_a).assigned_slot_datetime, expected)
+        self.assertEqual(queued_post.scheduled_at, expected)
 
 
 class PostingSlotCopyTests(TestCase):
