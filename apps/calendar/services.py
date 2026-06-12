@@ -39,7 +39,7 @@ def create_default_queue_and_slots(social_account):
     return queue
 
 
-def _next_slot_datetimes(social_account, after_dt, count=30):
+def _next_slot_datetimes(social_account, after_dt, count=30, excluded_datetimes=None):
     """Compute the next `count` PostingSlot datetimes for a social account.
 
     Starting from `after_dt`, walks forward through the week to find
@@ -50,6 +50,7 @@ def _next_slot_datetimes(social_account, after_dt, count=30):
         return []
 
     slot_list = list(slots)
+    excluded = set(excluded_datetimes or [])
     results = []
     current_date = after_dt.date()
 
@@ -68,12 +69,43 @@ def _next_slot_datetimes(social_account, after_dt, count=30):
 
             if slot_dt <= after_dt:
                 continue
+            if slot_dt in excluded:
+                continue
 
             results.append(slot_dt)
             if len(results) >= count:
                 return results
 
     return results
+
+
+def _occupied_scheduled_datetimes(social_account, after_dt, exclude_post_ids=None):
+    """Return future scheduled datetimes already taken by this social account."""
+    from apps.composer.models import PlatformPost
+
+    qs = PlatformPost.objects.filter(
+        social_account=social_account,
+        scheduled_at__gt=after_dt,
+        status=PlatformPost.Status.SCHEDULED,
+    )
+    if exclude_post_ids:
+        qs = qs.exclude(post_id__in=exclude_post_ids)
+    return set(qs.values_list("scheduled_at", flat=True))
+
+
+def next_available_slot_datetimes(social_account, after_dt, count=30, exclude_post_ids=None):
+    """Compute upcoming PostingSlot datetimes that are not already scheduled."""
+    occupied = _occupied_scheduled_datetimes(
+        social_account,
+        after_dt,
+        exclude_post_ids=exclude_post_ids,
+    )
+    return _next_slot_datetimes(
+        social_account,
+        after_dt,
+        count=count,
+        excluded_datetimes=occupied,
+    )
 
 
 def assign_queue_slots(queue):
@@ -86,6 +118,7 @@ def assign_queue_slots(queue):
     ``QueueEntry.assigned_slot_datetime`` in sync. ``Post.scheduled_at`` is
     then refreshed via ``sync_post_scheduled_at`` as min-of-children.
     """
+    from apps.composer.models import PlatformPost
     from apps.composer.services import sync_post_scheduled_at
 
     entries = queue.entries.select_related("post").order_by("position")
@@ -93,16 +126,36 @@ def assign_queue_slots(queue):
         return
 
     now = timezone.now()
-    slot_times = _next_slot_datetimes(queue.social_account, now, count=len(entries) + 10)
+    entry_post_ids = list(entries.values_list("post_id", flat=True))
+    slot_times = next_available_slot_datetimes(
+        queue.social_account,
+        now,
+        count=len(entries) + 10,
+        exclude_post_ids=entry_post_ids,
+    )
 
     touched_posts = []
-    for idx, entry in enumerate(entries):
-        slot_dt = slot_times[idx] if idx < len(slot_times) else None
+    slot_idx = 0
+    for entry in entries:
+        # Queue slots are per social account. A post that is already published
+        # for this queue's account should not be moved back into a future slot.
+        pp = entry.post.platform_posts.filter(social_account=queue.social_account).first()
+        if pp is not None and pp.status == PlatformPost.Status.PUBLISHED:
+            if entry.assigned_slot_datetime is not None:
+                entry.assigned_slot_datetime = None
+                entry.save(update_fields=["assigned_slot_datetime"])
+            if pp.scheduled_at and pp.scheduled_at > now:
+                pp.scheduled_at = None
+                pp.save(update_fields=["scheduled_at", "updated_at"])
+                touched_posts.append(entry.post)
+            continue
+
+        slot_dt = slot_times[slot_idx] if slot_idx < len(slot_times) else None
+        slot_idx += 1
         entry.assigned_slot_datetime = slot_dt
         entry.save(update_fields=["assigned_slot_datetime"])
 
         # Write the per-platform scheduled_at on the matching PlatformPost.
-        pp = entry.post.platform_posts.filter(social_account=queue.social_account).first()
         if pp is not None:
             pp.scheduled_at = slot_dt
             pp.save(update_fields=["scheduled_at", "updated_at"])

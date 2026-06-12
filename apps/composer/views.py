@@ -203,7 +203,7 @@ def _reassign_queue_slots_from_floor(queues, post, floor_date, workspace):
     each platform to pick its earliest available slot starting that day,
     independently.
     """
-    from apps.calendar.services import _next_slot_datetimes
+    from apps.calendar.services import next_available_slot_datetimes
     from apps.composer.services import sync_post_scheduled_at
 
     ws_tz = workspace.effective_timezone or "UTC"
@@ -214,7 +214,12 @@ def _reassign_queue_slots_from_floor(queues, post, floor_date, workspace):
     floor_dt = max(floor_dt, timezone.now())
 
     for q in queues:
-        slots = _next_slot_datetimes(q.social_account, floor_dt, count=1)
+        slots = next_available_slot_datetimes(
+            q.social_account,
+            floor_dt,
+            count=1,
+            exclude_post_ids=[post.id],
+        )
         if not slots:
             continue
         pp = post.platform_posts.filter(social_account=q.social_account).first()
