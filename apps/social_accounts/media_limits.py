@@ -1,9 +1,6 @@
 """Configured media upload limits used before publishing to providers."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
-
 
 MB = 1024 * 1024
 GB = 1024 * MB

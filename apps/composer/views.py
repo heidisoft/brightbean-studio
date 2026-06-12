@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import logging
 import re
 import uuid
 from datetime import UTC, datetime
@@ -49,8 +50,6 @@ from .models import (
 
 MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
 
-<<<<<<< Updated upstream
-=======
 logger = logging.getLogger(__name__)
 
 REMOTE_DELETE_UNSUPPORTED_PLATFORMS = {"instagram", "instagram_login"}
@@ -64,7 +63,6 @@ PUBLISH_MEDIA_ACTIONS = {
     "resubmit_for_approval",
 }
 
->>>>>>> Stashed changes
 
 def _get_workspace(request, workspace_id):
     """Resolve workspace and enforce membership check."""
