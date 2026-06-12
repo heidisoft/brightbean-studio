@@ -9,7 +9,7 @@ Context: account (with prefetched posting_slots), workspace_id.
 
 <div id="slots-grid-{{ account.id }}"
      hx-get="{% url 'calendar:account_slots_partial' workspace_id=workspace_id %}?social_account_id={{ account.id }}"
-     hx-trigger="slotsUpdated[accountId=='{{ account.id }}'] from:body"
+     hx-trigger="slotsUpdated from:body"
      hx-swap="outerHTML">
 
     <div class="overflow-x-auto">

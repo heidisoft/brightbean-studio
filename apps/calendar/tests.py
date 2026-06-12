@@ -1,10 +1,11 @@
 """Tests for the Content Calendar app (T-1A.2)."""
 
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 from django.utils import timezone
 
@@ -44,6 +45,17 @@ class PostingSlotModelTest(TestCase):
         slot = PostingSlot()
         slot.day_of_week = 4
         self.assertEqual(slot.day_name, "Friday")
+
+
+class PostingSlotGridTemplateTests(SimpleTestCase):
+    """Posting slot grids should refresh after HTMX slot actions."""
+
+    def test_grid_listens_for_slots_updated_without_fragile_filter(self):
+        template_path = Path("templates/social_accounts/partials/_posting_slots_grid.html")
+        body = template_path.read_text()
+
+        self.assertIn('hx-trigger="slotsUpdated from:body"', body)
+        self.assertNotIn("slotsUpdated[", body)
 
 
 class QueueSchedulingServiceTests(TestCase):
