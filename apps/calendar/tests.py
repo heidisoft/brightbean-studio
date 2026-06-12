@@ -278,3 +278,124 @@ class PostingSlotCrossWorkspaceTests(TestCase):
         self.assertEqual(response.status_code, 404)
         slot_a2.refresh_from_db()
         self.assertEqual(slot_a2.time, time(11, 0))
+
+
+class PostingSlotCopyTests(TestCase):
+    """Copying an account schedule should replace only the target account's slots."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="owner@example.com",
+            password="testpass123",
+            tos_accepted_at=timezone.now(),
+        )
+        self.org = Organization.objects.create(name="Org")
+        self.workspace = Workspace.objects.create(organization=self.org, name="Workspace")
+        OrgMembership.objects.create(
+            user=self.user,
+            organization=self.org,
+            org_role=OrgMembership.OrgRole.OWNER,
+        )
+        WorkspaceMembership.objects.create(
+            user=self.user,
+            workspace=self.workspace,
+            workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
+        )
+        self.source_account = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform="instagram",
+            account_platform_id="ig-source",
+            account_name="Source",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        self.target_account = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform="facebook",
+            account_platform_id="fb-target",
+            account_name="Target",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        self.url = reverse("calendar:copy_posting_slots", kwargs={"workspace_id": self.workspace.id})
+        self.client.force_login(self.user)
+
+    def test_copy_replaces_target_slots_with_source_schedule(self):
+        PostingSlot.objects.create(
+            social_account=self.source_account,
+            day_of_week=PostingSlot.DayOfWeek.MONDAY,
+            time=time(9, 0),
+            is_active=True,
+        )
+        PostingSlot.objects.create(
+            social_account=self.source_account,
+            day_of_week=PostingSlot.DayOfWeek.FRIDAY,
+            time=time(16, 30),
+            is_active=False,
+        )
+        PostingSlot.objects.create(
+            social_account=self.target_account,
+            day_of_week=PostingSlot.DayOfWeek.SUNDAY,
+            time=time(12, 0),
+        )
+
+        response = self.client.post(
+            self.url,
+            {
+                "source_social_account_id": self.source_account.id,
+                "target_social_account_id": self.target_account.id,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"copied": 2})
+        target_slots = list(
+            PostingSlot.objects.filter(social_account=self.target_account).order_by("day_of_week", "time")
+        )
+        self.assertEqual([(slot.day_of_week, slot.time, slot.is_active) for slot in target_slots], [
+            (PostingSlot.DayOfWeek.MONDAY, time(9, 0), True),
+            (PostingSlot.DayOfWeek.FRIDAY, time(16, 30), False),
+        ])
+
+    def test_copy_empty_source_clears_target_schedule(self):
+        PostingSlot.objects.create(
+            social_account=self.target_account,
+            day_of_week=PostingSlot.DayOfWeek.WEDNESDAY,
+            time=time(14, 0),
+        )
+
+        response = self.client.post(
+            self.url,
+            {
+                "source_social_account_id": self.source_account.id,
+                "target_social_account_id": self.target_account.id,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"copied": 0})
+        self.assertFalse(PostingSlot.objects.filter(social_account=self.target_account).exists())
+
+    def test_copy_rejects_source_account_from_another_workspace(self):
+        other_org = Organization.objects.create(name="Other Org")
+        other_workspace = Workspace.objects.create(organization=other_org, name="Other Workspace")
+        other_account = SocialAccount.objects.create(
+            workspace=other_workspace,
+            platform="instagram",
+            account_platform_id="ig-other",
+            account_name="Other",
+        )
+        PostingSlot.objects.create(
+            social_account=self.target_account,
+            day_of_week=PostingSlot.DayOfWeek.WEDNESDAY,
+            time=time(14, 0),
+        )
+
+        response = self.client.post(
+            self.url,
+            {
+                "source_social_account_id": other_account.id,
+                "target_social_account_id": self.target_account.id,
+            },
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(PostingSlot.objects.filter(social_account=self.target_account).exists())
