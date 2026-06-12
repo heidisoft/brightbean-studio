@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import logging
 import re
 import uuid
 from datetime import UTC, datetime
@@ -18,7 +19,8 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.utils import timezone
 from django.utils.html import strip_tags
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.cache import never_cache
+from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
 from apps.common.validators import (
     is_safe_url,
@@ -47,6 +49,10 @@ from .models import (
 )
 
 MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
+
+logger = logging.getLogger(__name__)
+
+REMOTE_DELETE_UNSUPPORTED_PLATFORMS = {"instagram", "instagram_login"}
 
 
 def _get_workspace(request, workspace_id):
@@ -266,6 +272,7 @@ def _resolve_template_data(template_id, workspace):
 
 @login_required
 @require_permission("create_posts")
+@never_cache
 def compose(request, workspace_id, post_id=None):
     """Render the full-page composer for creating or editing a post."""
     workspace = _get_workspace(request, workspace_id)
@@ -383,6 +390,27 @@ def compose(request, workspace_id, post_id=None):
     ws_role = membership.workspace_role if membership else None
     can_view_internal_notes = ws_role not in ("client", "viewer") if ws_role else True
 
+    # Template data pre-fill (if using a template)
+    template_id = request.GET.get("template")
+    template_data = None
+    if template_id and not post:
+        try:
+            tpl = PostTemplate.objects.get(id=template_id, workspace=workspace)
+            template_data = tpl.template_data
+        except (PostTemplate.DoesNotExist, ValidationError):
+            # Fall back to built-in template by integer ID
+            from apps.composer.builtin_templates import TEMPLATES as BUILTIN_TEMPLATES
+
+            builtin = next((t for t in BUILTIN_TEMPLATES if str(t["id"]) == template_id), None)
+            if builtin:
+                template_data = {"body": builtin.get("body", ""), "title": builtin.get("title", "")}
+
+    # Pre-fill caption from template data
+    if template_data and not post:
+        body = template_data.get("body", "")
+        if body:
+            form.initial["caption"] = body
+
     # Approval workflow context
     workflow_mode = workspace.approval_workflow_mode
     show_submit_button = workflow_mode != "none"
@@ -472,6 +500,7 @@ def compose(request, workspace_id, post_id=None):
         "workflow_mode": workflow_mode,
         "show_submit_button": show_submit_button,
         "show_resubmit_button": show_resubmit_button,
+        "remote_delete_summary": _remote_delete_summary(post),
         "approval_history": approval_history,
         "post_comments": post_comments,
         "pending_assets": pending_assets,
@@ -523,6 +552,76 @@ def _transition_post_children(post, target, *, allow_via_draft=True, only=None):
 def _platform_status_map(post):
     """Return ``{platform_post_id: status}`` for HTMX response headers."""
     return {str(pp.id): pp.status for pp in post.platform_posts.all()}
+
+
+def _remote_delete_summary(post):
+    """Build delete capability text for the post editor modal."""
+    if not post:
+        return {"supported": [], "unsupported": []}
+
+    supported = []
+    unsupported = []
+    for pp in post.platform_posts.select_related("social_account").filter(
+        status=PlatformPost.Status.PUBLISHED,
+    ):
+        account = pp.social_account
+        name = account.account_name or account.account_handle or account.get_platform_display()
+        label = f"{name} ({account.get_platform_display()})"
+        if account.platform in REMOTE_DELETE_UNSUPPORTED_PLATFORMS:
+            unsupported.append(label)
+        elif pp.platform_post_id:
+            supported.append(label)
+    return {"supported": supported, "unsupported": unsupported}
+
+
+def _delete_remote_platform_posts(platform_posts):
+    """Delete remote posts for local PlatformPosts that already published."""
+    from apps.publisher.engine import _resolve_publish_credentials
+    from providers import get_provider
+
+    errors = []
+    for pp in platform_posts:
+        if not pp.platform_post_id:
+            continue
+        account_name = pp.social_account.account_name or pp.social_account.account_handle
+        if pp.social_account.platform in REMOTE_DELETE_UNSUPPORTED_PLATFORMS:
+            logger.info(
+                "Remote delete skipped for PlatformPost %s on %s account %s (%s), remote id %s: unsupported platform",
+                pp.id,
+                pp.social_account.platform,
+                pp.social_account_id,
+                account_name,
+                pp.platform_post_id,
+            )
+            continue
+        try:
+            credentials = _resolve_publish_credentials(pp.social_account)
+            provider = get_provider(pp.social_account.platform, credentials)
+            provider.delete_post(pp.social_account.oauth_access_token, pp.platform_post_id)
+        except NotImplementedError as exc:
+            logger.info(
+                "Remote delete skipped for PlatformPost %s on %s account %s (%s), remote id %s: %s",
+                pp.id,
+                pp.social_account.platform,
+                pp.social_account_id,
+                account_name,
+                pp.platform_post_id,
+                exc,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Remote delete failed for PlatformPost %s on %s account %s (%s), remote id %s: %s",
+                pp.id,
+                pp.social_account.platform,
+                pp.social_account_id,
+                account_name,
+                pp.platform_post_id,
+                exc,
+            )
+            errors.append(
+                f"{account_name} ({pp.social_account.get_platform_display()}): {exc}"
+            )
+    return errors
 
 
 @login_required
@@ -894,7 +993,8 @@ def autosave(request, workspace_id, post_id=None):
 
 
 @login_required
-@require_GET
+@never_cache
+@require_http_methods(["GET", "POST"])
 def preview(request, workspace_id):
     """Live preview endpoint - renders platform-specific preview from form state.
 
@@ -902,10 +1002,11 @@ def preview(request, workspace_id):
     Stateless - no DB queries except social account lookup.
     """
     workspace = _get_workspace(request, workspace_id)
-    title = request.GET.get("title", "")
-    caption = request.GET.get("caption", "")
-    first_comment = request.GET.get("first_comment", "")
-    selected_ids_str = request.GET.get("selected_accounts", "")
+    data = request.POST if request.method == "POST" else request.GET
+    title = data.get("title", "")
+    caption = data.get("caption", "")
+    first_comment = data.get("first_comment", "")
+    selected_ids_str = data.get("selected_accounts", "")
     selected_ids = [s.strip() for s in selected_ids_str.split(",") if s.strip()]
 
     # Build preview data per platform
@@ -918,8 +1019,8 @@ def preview(request, workspace_id):
         for account in accounts:
             override_title_key = f"override_title_{account.id}"
             override_key = f"override_caption_{account.id}"
-            effective_title = request.GET.get(override_title_key, "") or title
-            effective_caption = request.GET.get(override_key, "") or caption
+            effective_title = data.get(override_title_key, "") or title
+            effective_caption = data.get(override_key, "") or caption
             char_limit = account.char_limit
             field_config = account.field_config
             previews.append(
@@ -942,7 +1043,7 @@ def preview(request, workspace_id):
     from apps.media_library.models import MediaAsset
 
     media_items = []
-    post_id_str = request.GET.get("_autosave_post_id", "")
+    post_id_str = data.get("_autosave_post_id", "")
 
     if post_id_str:
         try:
@@ -1405,13 +1506,27 @@ def post_delete(request, workspace_id, post_id):
     post = get_object_or_404(Post, id=post_id, workspace=workspace)
 
     account_id = request.GET.get("account") or request.POST.get("account")
+    delete_remote = request.POST.get("delete_remote") == "true"
     if account_id:
-        pp = get_object_or_404(PlatformPost, post=post, social_account_id=account_id)
+        pp = get_object_or_404(
+            PlatformPost.objects.select_related("social_account"),
+            post=post,
+            social_account_id=account_id,
+        )
+        if delete_remote:
+            remote_errors = _delete_remote_platform_posts([pp])
+            if remote_errors:
+                return JsonResponse({"errors": {"delete": remote_errors}}, status=502)
         pp.delete()
         # If no platform posts remain, clean up the parent post too.
         if not post.platform_posts.exists():
             post.delete()
     else:
+        if delete_remote:
+            platform_posts = list(post.platform_posts.select_related("social_account"))
+            remote_errors = _delete_remote_platform_posts(platform_posts)
+            if remote_errors:
+                return JsonResponse({"errors": {"delete": remote_errors}}, status=502)
         post.delete()
 
     return HttpResponse(
@@ -1452,7 +1567,9 @@ def _idea_columns(workspace, tag=None):
         .order_by("position", "-created_at")
     )
     if tag:
-        ideas_qs = ideas_qs.filter(tags__contains=[tag])
+        from apps.utils import json_tag_contains
+
+        ideas_qs = ideas_qs.filter(json_tag_contains("tags", tag))
 
     grouped_ideas = {str(grp.id): [] for grp in groups}
     for idea in ideas_qs:

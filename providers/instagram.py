@@ -35,6 +35,14 @@ BASE_URL = "https://graph.facebook.com/v21.0"
 OAUTH_URL = "https://www.facebook.com/v21.0/dialog/oauth"
 TOKEN_URL = f"{BASE_URL}/oauth/access_token"
 
+
+def _is_invalid_insights_metric_error(exc: APIError) -> bool:
+    error = (exc.raw_response or {}).get("error", {})
+    message = str(error.get("message", "")).lower()
+    return error.get("code") == 100 and (
+        "valid insights metric" in message or "must be one of the following values" in message
+    )
+
 # Polling settings for container status checks
 CONTAINER_POLL_INTERVAL = 2  # seconds
 CONTAINER_POLL_MAX_ATTEMPTS = 60
@@ -79,6 +87,7 @@ class InstagramProvider(SocialProvider):
     @property
     def required_scopes(self) -> list[str]:
         return [
+            "pages_show_list",
             "instagram_basic",
             "instagram_content_publish",
             "instagram_manage_comments",
@@ -180,6 +189,67 @@ class InstagramProvider(SocialProvider):
             follower_count=data.get("followers_count", 0),
             extra=data,
         )
+
+    # ------------------------------------------------------------------
+    # Linked Instagram accounts
+    # ------------------------------------------------------------------
+
+    def get_user_pages(self, access_token: str) -> list[dict]:
+        """Fetch Instagram business/creator accounts linked to Facebook Pages.
+
+        The social-account connection flow uses this method for any provider
+        that can expose multiple selectable accounts from one OAuth grant. For
+        Instagram Graph API, those selectable accounts are the Instagram
+        business/creator accounts linked to Pages the user can manage.
+        """
+        resp = self._request(
+            "GET",
+            f"{BASE_URL}/me/accounts",
+            access_token=access_token,
+            params={
+                "fields": (
+                    "id,name,access_token,category,picture,"
+                    "instagram_business_account{id,username,name,profile_picture_url,followers_count}"
+                )
+            },
+        )
+        data = resp.json()
+        if "error" in data:
+            logger.error("Instagram /me/accounts error: %s", data["error"])
+            raise APIError(
+                f"Failed to fetch Instagram accounts: {data['error'].get('message', 'Unknown error')}",
+                platform=self.platform_name,
+                raw_response=data,
+            )
+
+        accounts: list[dict] = []
+        for page in data.get("data", []):
+            ig_account = page.get("instagram_business_account")
+            if not ig_account:
+                continue
+
+            picture_url = ig_account.get("profile_picture_url")
+            if not picture_url and "picture" in page and "data" in page["picture"]:
+                picture_url = page["picture"]["data"].get("url")
+
+            username = ig_account.get("username")
+            display_name = ig_account.get("name") or username or page.get("name", "")
+            accounts.append(
+                {
+                    "id": ig_account["id"],
+                    "name": display_name,
+                    "handle": username,
+                    "access_token": page.get("access_token", access_token),
+                    "category": page.get("category", ""),
+                    "picture": picture_url,
+                    "followers_count": ig_account.get("followers_count", 0),
+                    "page_id": page.get("id"),
+                    "page_name": page.get("name", ""),
+                }
+            )
+
+        logger.debug("Instagram /me/accounts returned %d linked accounts", len(accounts))
+        return accounts
 
     # ------------------------------------------------------------------
     # Publishing (two-step container flow)
@@ -314,6 +384,12 @@ class InstagramProvider(SocialProvider):
             extra=data,
         )
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        raise NotImplementedError(
+            "Instagram does not support deleting already-published media through the Graph API."
+        )
+
+
     # ------------------------------------------------------------------
     # Comments
     # ------------------------------------------------------------------
@@ -334,56 +410,72 @@ class InstagramProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def get_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
-        metrics = ["impressions", "reach", "engagement", "saved"]
-        resp = self._request(
-            "GET",
-            f"{BASE_URL}/{post_id}/insights",
-            access_token=access_token,
-            params={"metric": ",".join(metrics)},
-        )
-        data = resp.json()
-        values: dict = {}
-        for entry in data.get("data", []):
-            name = entry.get("name", "")
-            val = entry.get("values", [{}])[0].get("value", 0)
-            values[name] = val
+        metrics = ["views", "reach", "saved", "likes", "comments", "shares", "profile_visits", "total_interactions"]
+        values = self._get_insight_values(f"{BASE_URL}/{post_id}/insights", access_token, metrics)
 
         return PostMetrics(
-            impressions=values.get("impressions", 0),
+            impressions=values.get("views", 0),
             reach=values.get("reach", 0),
-            engagements=values.get("engagement", 0),
+            likes=values.get("likes", 0),
+            comments=values.get("comments", 0),
+            shares=values.get("shares", 0),
             saves=values.get("saved", 0),
-            extra={"raw_insights": values},
+            extra={
+                "raw_insights": values,
+                "profile_visits": values.get("profile_visits", 0),
+                "total_interactions": values.get("total_interactions", 0),
+            },
         )
 
     def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
         ig_user_id = self.credentials.get("ig_user_id", "me")
-        metrics = ["impressions", "reach", "follower_count", "profile_views"]
-        resp = self._request(
-            "GET",
+        metrics = ["views", "reach", "profile_views", "follows"]
+        values = self._get_insight_values(
             f"{BASE_URL}/{ig_user_id}/insights",
-            access_token=access_token,
+            access_token,
+            metrics,
             params={
-                "metric": ",".join(metrics),
                 "period": "day",
                 "since": int(date_range[0].timestamp()),
                 "until": int(date_range[1].timestamp()),
             },
+            metric_params={"views": {"metric_type": "total_value"}},
         )
-        data = resp.json()
-        values: dict = {}
-        for entry in data.get("data", []):
-            name = entry.get("name", "")
-            val = entry.get("values", [{}])[0].get("value", 0)
-            values[name] = val
 
         return AccountMetrics(
-            impressions=values.get("impressions", 0),
+            impressions=values.get("views", 0),
             reach=values.get("reach", 0),
-            followers=values.get("follower_count", 0),
+            followers_gained=values.get("follows", 0),
             profile_views=values.get("profile_views", 0),
             extra={"raw_insights": values},
         )
+
+    def _get_insight_values(
+        self,
+        url: str,
+        access_token: str,
+        metrics: list[str],
+        params: dict | None = None,
+        metric_params: dict[str, dict] | None = None,
+    ) -> dict:
+        """Fetch insight metrics one by one so deprecated metrics don't poison the batch."""
+        values: dict = {}
+        for metric in metrics:
+            request_params = dict(params or {})
+            request_params.update((metric_params or {}).get(metric, {}))
+            request_params["metric"] = metric
+            try:
+                resp = self._request("GET", url, access_token=access_token, params=request_params)
+            except APIError as exc:
+                if _is_invalid_insights_metric_error(exc):
+                    logger.info("Skipping deprecated/invalid Instagram insights metric %s", metric)
+                    continue
+                raise
+            for entry in resp.json().get("data", []):
+                name = entry.get("name", "")
+                val = entry.get("values", [{}])[0].get("value", 0)
+                values[name] = val
+        return values
 
     # ------------------------------------------------------------------
     # Inbox

@@ -11,6 +11,7 @@ urlpatterns = [
     path("reschedule/", views.reschedule_post, name="reschedule"),
     # Posting slots
     path("posting-slots/", views.posting_slots, name="posting_slots"),
+    path("posting-slots/copy/", views.copy_posting_slots, name="copy_posting_slots"),
     path("posting-slots/save/", views.save_posting_slot, name="save_posting_slot"),
     path("posting-slots/grid/", views.account_posting_slots_partial, name="account_slots_partial"),
     path("posting-slots/toggle-day/", views.toggle_posting_slot_day, name="toggle_posting_slot_day"),

@@ -31,6 +31,14 @@ OAUTH_URL = "https://www.facebook.com/v21.0/dialog/oauth"
 TOKEN_URL = f"{BASE_URL}/oauth/access_token"
 
 
+def _is_invalid_insights_metric_error(exc: APIError) -> bool:
+    error = (exc.raw_response or {}).get("error", {})
+    message = str(error.get("message", "")).lower()
+    return error.get("code") == 100 and (
+        "valid insights metric" in message or "must be one of the following values" in message
+    )
+
+
 class FacebookProvider(SocialProvider):
     """Facebook Graph API v21.0 provider."""
 
@@ -299,6 +307,20 @@ class FacebookProvider(SocialProvider):
             extra=data,
         )
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        """Delete an existing Facebook Page post/photo/video."""
+        if not post_id:
+            raise PublishError(
+                "post_id is required for Facebook post deletion",
+                platform=self.platform_name,
+            )
+        self._request(
+            "DELETE",
+            f"{BASE_URL}/{post_id}",
+            access_token=access_token,
+        )
+        return True
+
     # ------------------------------------------------------------------
     # Comments
     # ------------------------------------------------------------------
@@ -320,60 +342,98 @@ class FacebookProvider(SocialProvider):
     def get_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
         metrics = [
             "post_impressions",
+            "post_impressions_unique",
             "post_engaged_users",
             "post_clicks",
             "post_reactions_by_type_total",
         ]
-        resp = self._request(
-            "GET",
-            f"{BASE_URL}/{post_id}/insights",
-            access_token=access_token,
-            params={"metric": ",".join(metrics)},
-        )
-        data = resp.json()
-        values: dict = {}
-        for entry in data.get("data", []):
-            name = entry.get("name", "")
-            val = entry.get("values", [{}])[0].get("value", 0)
-            values[name] = val
+        values = self._get_insight_values(f"{BASE_URL}/{post_id}/insights", access_token, metrics)
+        summary = self._get_post_summary_counts(access_token, post_id)
 
         reactions = values.get("post_reactions_by_type_total", {})
-        total_likes = reactions.get("like", 0) + reactions.get("love", 0) if isinstance(reactions, dict) else 0
+        total_reactions = sum(v for v in reactions.values() if isinstance(v, int | float)) if isinstance(reactions, dict) else 0
 
         return PostMetrics(
             impressions=values.get("post_impressions", 0),
+            reach=values.get("post_impressions_unique", 0),
             engagements=values.get("post_engaged_users", 0),
             clicks=values.get("post_clicks", 0),
-            likes=total_likes,
+            likes=total_reactions,
+            comments=summary.get("comments", 0),
+            shares=summary.get("shares", 0),
             extra={"raw_insights": values},
         )
 
     def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
         page_id = self.credentials.get("page_id", "me")
-        metrics = ["page_impressions", "page_engaged_users", "page_fans"]
-        resp = self._request(
-            "GET",
+        metrics = [
+            "page_impressions",
+            "page_impressions_unique",
+            "page_engaged_users",
+            "page_fans",
+            "page_daily_follows",
+        ]
+        values = self._get_insight_values(
             f"{BASE_URL}/{page_id}/insights",
-            access_token=access_token,
+            access_token,
+            metrics,
             params={
-                "metric": ",".join(metrics),
                 "since": int(date_range[0].timestamp()),
                 "until": int(date_range[1].timestamp()),
             },
         )
-        data = resp.json()
-        values: dict = {}
-        for entry in data.get("data", []):
-            name = entry.get("name", "")
-            val = entry.get("values", [{}])[0].get("value", 0)
-            values[name] = val
 
         return AccountMetrics(
             impressions=values.get("page_impressions", 0),
-            reach=values.get("page_engaged_users", 0),
+            reach=values.get("page_impressions_unique", values.get("page_engaged_users", 0)),
             followers=values.get("page_fans", 0),
+            followers_gained=values.get("page_daily_follows", 0),
             extra={"raw_insights": values},
         )
+
+    def _get_post_summary_counts(self, access_token: str, post_id: str) -> dict[str, int]:
+        """Fetch post comment/share totals that are exposed as Graph fields."""
+        try:
+            resp = self._request(
+                "GET",
+                f"{BASE_URL}/{post_id}",
+                access_token=access_token,
+                params={"fields": "comments.limit(0).summary(true),shares"},
+            )
+        except APIError as exc:
+            logger.info("Skipping Facebook post summary counts for %s: %s", post_id, exc)
+            return {}
+
+        data = resp.json()
+        comments = data.get("comments", {}).get("summary", {}).get("total_count", 0)
+        shares_obj = data.get("shares", {})
+        shares = shares_obj.get("count", shares_obj.get("share_count", 0)) if isinstance(shares_obj, dict) else 0
+        return {"comments": int(comments or 0), "shares": int(shares or 0)}
+
+    def _get_insight_values(
+        self,
+        url: str,
+        access_token: str,
+        metrics: list[str],
+        params: dict | None = None,
+    ) -> dict:
+        """Fetch insight metrics one by one so deprecated metrics don't poison the batch."""
+        values: dict = {}
+        for metric in metrics:
+            request_params = dict(params or {})
+            request_params["metric"] = metric
+            try:
+                resp = self._request("GET", url, access_token=access_token, params=request_params)
+            except APIError as exc:
+                if _is_invalid_insights_metric_error(exc):
+                    logger.info("Skipping deprecated/invalid Facebook insights metric %s", metric)
+                    continue
+                raise
+            for entry in resp.json().get("data", []):
+                name = entry.get("name", "")
+                val = entry.get("values", [{}])[0].get("value", 0)
+                values[name] = val
+        return values
 
     # ------------------------------------------------------------------
     # Inbox

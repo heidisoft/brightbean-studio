@@ -300,6 +300,20 @@ class YouTubeProvider(SocialProvider):
             platform=self.platform_name,
         )
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        if not post_id:
+            raise PublishError(
+                "post_id is required for YouTube video deletion",
+                platform=self.platform_name,
+            )
+        self._request(
+            "DELETE",
+            f"{API_BASE}/videos",
+            access_token=access_token,
+            params={"id": post_id},
+        )
+        return True
+
     # ------------------------------------------------------------------
     # Comments
     # ------------------------------------------------------------------

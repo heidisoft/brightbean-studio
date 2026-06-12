@@ -91,6 +91,20 @@ DEFAULT_BACKFILL_DAYS = 90
 # native fields into different ``PostMetrics`` slots — these overrides realign
 # them with the keys the UI queries from ``PLATFORM_METRICS``.
 _POST_FIELD_OVERRIDES: dict[str, dict[str, str]] = {
+    "facebook": {
+        # providers/facebook.py transports Meta's post_reactions_by_type_total
+        # through the generic likes slot; the Facebook catalog displays that
+        # number as reactions.
+        "likes": "reactions",
+    },
+    "instagram": {
+        # providers/instagram.py maps IG's current ``views`` insight into the
+        # dataclass's impressions slot for backwards-compatible transport.
+        "impressions": "views",
+    },
+    "instagram_login": {
+        "impressions": "views",
+    },
     "threads": {
         # providers/threads.py:419-423 stuffs views/replies/reposts into the
         # impressions/comments/shares dataclass fields.
@@ -134,9 +148,23 @@ _GENERIC_POST_EXTRA_KEYS = (
     "replies",
     "reposts",
     "outbound",
+    "profile_visits",
     "watch_time",
     "avg_view_pct",
 )
+
+# Per-platform overrides for ``AccountMetrics`` field → catalog metric_key.
+_ACCOUNT_FIELD_OVERRIDES: dict[str, dict[str, str]] = {
+    "instagram": {
+        # Instagram's current account insight is ``views``. The provider uses
+        # the generic impressions slot for transport, so persist it under the
+        # catalog key the page renders.
+        "impressions": "views",
+    },
+    "instagram_login": {
+        "impressions": "views",
+    },
+}
 
 
 def _post_metrics_to_dict(metrics, platform: str) -> dict[str, float]:
@@ -196,6 +224,7 @@ def _account_metrics_to_dict(metrics, platform: str) -> dict[str, float]:
     from .metrics import PLATFORM_METRICS
 
     out: dict[str, float] = {}
+    field_overrides = _ACCOUNT_FIELD_OVERRIDES.get(platform, {})
     for src, key in (
         ("impressions", "impressions"),
         ("reach", "reach"),
@@ -203,7 +232,7 @@ def _account_metrics_to_dict(metrics, platform: str) -> dict[str, float]:
     ):
         v = getattr(metrics, src, 0) or 0
         if v:
-            out[key] = float(v)
+            out[field_overrides.get(src, key)] = float(v)
     # followers_gained = daily new follows; catalog calls it ``follows`` for
     # most platforms (and ``subscribers`` for YouTube — promoted from extra).
     gained = getattr(metrics, "followers_gained", 0) or 0
@@ -253,6 +282,16 @@ def _resolve_provider(account):
             }
         except MastodonAppRegistration.DoesNotExist:
             pass
+    elif account.platform == "instagram":
+        # Instagram Graph analytics needs the IG user ID; connected accounts
+        # store it on account_platform_id. Without this, account metrics use
+        # ``me`` and profile/post helper paths can make the wrong discovery
+        # call with a selected Page token.
+        credentials = {**credentials, "ig_user_id": account.account_platform_id}
+    elif account.platform == "facebook":
+        # Page metrics should be requested for the connected Page, not the
+        # token owner represented by ``me``.
+        credentials = {**credentials, "page_id": account.account_platform_id}
     return get_provider(account.platform, credentials)
 
 
@@ -274,6 +313,73 @@ def _is_insufficient_scope(exc: Exception) -> bool:
             "(#200)",  # Meta's permission-denied subcode
         )
     )
+
+
+def _is_invalid_auth(exc: Exception) -> bool:
+    """True when a provider rejected the access token itself."""
+    if getattr(exc, "status_code", None) in (401, 403):
+        msg = str(exc).lower()
+        return any(
+            marker in msg
+            for marker in (
+                "invalid credentials",
+                "invalid authentication credentials",
+                "invalid access token",
+                "access token expired",
+                "expired token",
+            )
+        )
+    return False
+
+
+def _refresh_analytics_token(account, provider) -> str:
+    """Refresh and persist an OAuth access token for analytics sync."""
+    from providers.types import AuthType
+
+    if provider.auth_type != AuthType.OAUTH2 or not account.oauth_refresh_token:
+        return account.oauth_access_token
+
+    new_tokens = provider.refresh_token(account.oauth_refresh_token)
+    account.oauth_access_token = new_tokens.access_token
+    if new_tokens.refresh_token:
+        account.oauth_refresh_token = new_tokens.refresh_token
+    if new_tokens.expires_in:
+        account.token_expires_at = timezone.now() + timedelta(seconds=new_tokens.expires_in)
+    account.connection_status = account.ConnectionStatus.CONNECTED
+    account.save(
+        update_fields=[
+            "oauth_access_token",
+            "oauth_refresh_token",
+            "token_expires_at",
+            "connection_status",
+            "updated_at",
+        ]
+    )
+    logger.info("Analytics sync refreshed token for %s", account)
+    return new_tokens.access_token
+
+
+def _analytics_access_token(account, provider) -> str:
+    """Return a fresh-enough access token for analytics calls."""
+    refresh_at = timezone.now() + timedelta(minutes=5)
+    if account.token_expires_at and account.token_expires_at <= refresh_at:
+        try:
+            return _refresh_analytics_token(account, provider)
+        except Exception as exc:
+            logger.warning("Analytics token refresh failed for %s: %s", account, exc)
+    return account.oauth_access_token
+
+
+def _call_with_analytics_token(account, provider, fn):
+    """Call ``fn(access_token)``, refreshing once if the token is rejected."""
+    access_token = _analytics_access_token(account, provider)
+    try:
+        return fn(access_token)
+    except Exception as exc:
+        if not _is_invalid_auth(exc):
+            raise
+        refreshed_token = _refresh_analytics_token(account, provider)
+        return fn(refreshed_token)
 
 
 def _write_account_snapshot(account, metric_values: dict[str, float], on_date: dt_date) -> int:
@@ -372,7 +478,11 @@ def _sync_account_metrics(account, on_date: dt_date) -> None:
         start = datetime.combine(target, time.min, tzinfo=tz)
         end = datetime.combine(target, time.max, tzinfo=tz)
         try:
-            metrics = provider.get_account_metrics(account.oauth_access_token, (start, end))
+            metrics = _call_with_analytics_token(
+                account,
+                provider,
+                lambda access_token: provider.get_account_metrics(access_token, (start, end)),
+            )
         except NotImplementedError:
             return
         except Exception as exc:
@@ -423,7 +533,11 @@ def _sync_youtube_post_analytics(account, provider, on_date: dt_date) -> None:
     end = datetime.combine(on_date, time.max, tzinfo=tz)
 
     try:
-        per_video = provider.get_post_analytics(account.oauth_access_token, post_ids, (start, end))
+        per_video = _call_with_analytics_token(
+            account,
+            provider,
+            lambda access_token: provider.get_post_analytics(access_token, post_ids, (start, end)),
+        )
     except NotImplementedError:
         return
     except Exception as exc:
@@ -451,7 +565,11 @@ def _sync_post_metrics(post, on_date: dt_date) -> None:
     account = post.social_account
     provider = _resolve_provider(account)
     try:
-        metrics = provider.get_post_metrics(account.oauth_access_token, post.platform_post_id)
+        metrics = _call_with_analytics_token(
+            account,
+            provider,
+            lambda access_token: provider.get_post_metrics(access_token, post.platform_post_id),
+        )
     except NotImplementedError:
         return
     except Exception as exc:
