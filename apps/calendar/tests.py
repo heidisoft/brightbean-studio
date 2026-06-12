@@ -280,6 +280,7 @@ class PostingSlotCrossWorkspaceTests(TestCase):
         slot_a2.refresh_from_db()
         self.assertEqual(slot_a2.time, time(11, 0))
 
+
 class QueueSlotAssignmentTests(TestCase):
     """Regression tests for per-account next available slot assignment."""
 
@@ -418,8 +419,8 @@ class QueueSlotAssignmentTests(TestCase):
 
         published_platform_post.refresh_from_db()
         published_post.refresh_from_db()
-        self.assertIsNone(published_platform_post.scheduled_at)
-        self.assertIsNone(published_post.scheduled_at)
+        self.assertEqual(published_platform_post.scheduled_at, self.first_slot)
+        self.assertEqual(published_post.scheduled_at, self.first_slot)
         self.assertIsNone(published_post.queue_entries.get(queue=self.queue_a).assigned_slot_datetime)
 
         queued_post = self._post_for_accounts(self.account_a)
