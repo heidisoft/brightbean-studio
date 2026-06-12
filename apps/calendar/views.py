@@ -57,6 +57,14 @@ def _slots_updated_response(account_id):
     )
 
 
+def _reassign_account_queues(social_account):
+    """Refresh queued posts after an account's posting slots change."""
+    from .services import assign_queue_slots
+
+    for queue in Queue.objects.filter(social_account=social_account, is_active=True):
+        assign_queue_slots(queue)
+
+
 def _get_workspace(request, workspace_id):
     """Resolve workspace and enforce membership check."""
     workspace = get_object_or_404(Workspace, id=workspace_id)
@@ -894,6 +902,7 @@ def copy_posting_slots(request, workspace_id):
     with transaction.atomic():
         PostingSlot.objects.filter(social_account=target_account).delete()
         PostingSlot.objects.bulk_create(copied_slots)
+        _reassign_account_queues(target_account)
 
     if request.htmx:
         return _slots_updated_response(target_account.id)
@@ -929,6 +938,7 @@ def save_posting_slot(request, workspace_id):
         time=slot_time,
         defaults={"is_active": True},
     )
+    _reassign_account_queues(account)
 
     if request.htmx:
         return _slots_updated_response(account.id)
@@ -947,7 +957,9 @@ def delete_posting_slot(request, workspace_id, slot_id):
     )
 
     account_id = str(slot.social_account_id)
+    account = slot.social_account
     slot.delete()
+    _reassign_account_queues(account)
     if request.htmx:
         return _slots_updated_response(account_id)
     return JsonResponse({"deleted": True})
@@ -994,6 +1006,7 @@ def toggle_posting_slot_day(request, workspace_id):
     # If all active → deactivate; otherwise → activate all
     all_active = not slots.filter(is_active=False).exists()
     slots.update(is_active=not all_active)
+    _reassign_account_queues(account)
 
     if request.htmx:
         return _slots_updated_response(account_id)
@@ -1034,6 +1047,7 @@ def update_posting_slot(request, workspace_id, slot_id):
 
     slot.time = new_time
     slot.save(update_fields=["time", "updated_at"])
+    _reassign_account_queues(slot.social_account)
 
     account_id = str(slot.social_account_id)
     if request.htmx:
