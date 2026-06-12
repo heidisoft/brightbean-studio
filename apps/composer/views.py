@@ -77,9 +77,12 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
     ``"pending_review"``). Existing rows are not touched here — call
     ``_transition_post_children`` separately if you want to move them.
     """
-    selected_ids_str = request.POST.get("selected_accounts", "")
-    selected_ids = [s.strip() for s in selected_ids_str.split(",") if s.strip()]
-    post.platform_posts.exclude(social_account_id__in=selected_ids).delete()
+    selected_ids = _selected_account_ids_from_request(request)
+    delete_qs = post.platform_posts.all()
+    scoped_account_id = _scoped_account_id_from_request(request)
+    if scoped_account_id:
+        delete_qs = delete_qs.filter(social_account_id=scoped_account_id)
+    delete_qs.exclude(social_account_id__in=selected_ids).delete()
     for acc_id in selected_ids:
         try:
             account = SocialAccount.objects.get(id=acc_id, workspace=workspace)
@@ -126,6 +129,67 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
             }
 
         pp.save()
+
+
+def _selected_account_ids_from_request(request):
+    selected_ids_str = request.POST.get("selected_accounts", "")
+    return [s.strip() for s in selected_ids_str.split(",") if s.strip()]
+
+
+def _scoped_account_id_from_request(request):
+    """Return the optional account scope for single-channel composer edits.
+
+    Calendar/list chips open the composer with ``?account=...`` so the UI only
+    renders that one channel. The hidden ``account_scope`` field lets save and
+    autosave know that omitted sibling accounts were not part of the submitted
+    form and must not be deleted.
+    """
+    return (request.POST.get("account_scope") or "").strip()
+
+
+def _scoped_target_platform_post_ids(request, post):
+    """Return PlatformPost IDs touched by a scoped form, or None for all."""
+    if not _scoped_account_id_from_request(request):
+        return None
+    selected_ids = _selected_account_ids_from_request(request)
+    return list(post.platform_posts.filter(social_account_id__in=selected_ids).values_list("id", flat=True))
+
+
+def _platform_posts_for_schedule_propagation(request, post):
+    qs = post.platform_posts.all()
+    if _scoped_account_id_from_request(request):
+        selected_ids = _selected_account_ids_from_request(request)
+        qs = qs.filter(social_account_id__in=selected_ids)
+    return qs
+
+
+def _approval_target_for_request(request, post):
+    """Return the approval service target for this form submission."""
+    scoped_account_id = _scoped_account_id_from_request(request)
+    if not scoped_account_id:
+        return post
+    selected_ids = _selected_account_ids_from_request(request)
+    if scoped_account_id not in selected_ids:
+        return None
+    return post.platform_posts.filter(social_account_id=scoped_account_id).first()
+
+
+def _materialize_omitted_scoped_fallback_schedules(request, post, fallback_scheduled_at):
+    """Freeze omitted scheduled siblings before a scoped edit changes the parent.
+
+    Some older PlatformPost rows rely on ``Post.scheduled_at`` through the
+    Coalesce fallback used by calendar and publisher queries. If a scoped edit
+    changes the parent schedule, omitted siblings with NULL child schedules
+    would inherit the scoped account's new time. Materialize their previous
+    effective time before the parent changes.
+    """
+    if not post.pk or not fallback_scheduled_at or not _scoped_account_id_from_request(request):
+        return
+    selected_ids = _selected_account_ids_from_request(request)
+    post.platform_posts.filter(
+        status=PlatformPost.Status.SCHEDULED,
+        scheduled_at__isnull=True,
+    ).exclude(social_account_id__in=selected_ids).update(scheduled_at=fallback_scheduled_at)
 
 
 def _save_version(post, user):
@@ -505,6 +569,7 @@ def compose(request, workspace_id, post_id=None):
         "post_comments": post_comments,
         "pending_assets": pending_assets,
         "all_tags": all_tags,
+        "account_filter": account_filter,
     }
     return render(request, "composer/compose.html", context)
 
@@ -629,9 +694,11 @@ def save_post(request, workspace_id, post_id=None):
     """Save or update a post (draft, schedule, or publish action)."""
     workspace = _get_workspace(request, workspace_id)
     action = request.POST.get("action", "save_draft")
+    original_scheduled_at = None
 
     if post_id:
         post = get_object_or_404(Post, id=post_id, workspace=workspace)
+        original_scheduled_at = post.scheduled_at
         # Enforce edit permissions: authors can edit their own, others need edit_others_posts
         membership = request.workspace_membership
         perms = membership.effective_permissions if membership else {}
@@ -654,6 +721,8 @@ def save_post(request, workspace_id, post_id=None):
     # which is why we sync those before/after running it.
     pending_target = None  # what to transition existing children to after sync
     initial_status = "draft"  # default status for newly created PlatformPosts
+    if action in ("schedule", "publish_now", "add_to_queue", "add_to_queue_priority"):
+        _materialize_omitted_scoped_fallback_schedules(request, post, original_scheduled_at)
 
     if action == "schedule":
         sched_date = form.cleaned_data.get("scheduled_date")
@@ -708,7 +777,7 @@ def save_post(request, workspace_id, post_id=None):
         if floor_date:
             _reassign_queue_slots_from_floor(queues, post, floor_date, workspace)
         # Transition every child whose scheduled_at was filled in to "scheduled".
-        _transition_post_children(post, "scheduled")
+        _transition_post_children(post, "scheduled", only=_scoped_target_platform_post_ids(request, post))
         _save_version(post, request.user)
         if request.htmx:
             return HttpResponse(
@@ -730,7 +799,7 @@ def save_post(request, workspace_id, post_id=None):
         _sync_platform_posts(request, post, workspace, initial_status="draft")
         for q in queues:
             add_to_queue(post, q, priority=True)
-        _transition_post_children(post, "scheduled")
+        _transition_post_children(post, "scheduled", only=_scoped_target_platform_post_ids(request, post))
         _save_version(post, request.user)
         if request.htmx:
             return HttpResponse(
@@ -749,7 +818,9 @@ def save_post(request, workspace_id, post_id=None):
         _save_version(post, request.user)
         from apps.approvals.services import submit_for_review
 
-        submit_for_review(post, request.user, workspace)
+        approval_target = _approval_target_for_request(request, post)
+        if approval_target is not None:
+            submit_for_review(approval_target, request.user, workspace)
         if request.htmx:
             return HttpResponse(
                 status=204,
@@ -766,7 +837,9 @@ def save_post(request, workspace_id, post_id=None):
         _save_version(post, request.user)
         from apps.approvals.services import resubmit_post
 
-        resubmit_post(post, request.user, workspace)
+        approval_target = _approval_target_for_request(request, post)
+        if approval_target is not None:
+            resubmit_post(approval_target, request.user, workspace)
         if request.htmx:
             return HttpResponse(
                 status=204,
@@ -842,12 +915,12 @@ def save_post(request, workspace_id, post_id=None):
     # PlatformPost now that they exist.
     propagate_dt = getattr(post, "_schedule_propagate_dt", None)
     if propagate_dt is not None:
-        post.platform_posts.update(scheduled_at=propagate_dt)
+        _platform_posts_for_schedule_propagation(request, post).update(scheduled_at=propagate_dt)
 
     # Move existing children to the requested target state (no-op for
     # save_draft — children that are already mid-workflow stay put).
     if pending_target:
-        _transition_post_children(post, pending_target)
+        _transition_post_children(post, pending_target, only=_scoped_target_platform_post_ids(request, post))
 
     # Save version
     _save_version(post, request.user)
@@ -974,10 +1047,14 @@ def autosave(request, workspace_id, post_id=None):
                     continue
             del request.session[session_key]
 
-    # Sync platform selections
-    selected_ids_str = request.POST.get("selected_accounts", "")
-    selected_ids = [s.strip() for s in selected_ids_str.split(",") if s.strip()]
-    post.platform_posts.exclude(social_account_id__in=selected_ids).delete()
+    # Sync platform selections. Scoped composer edits only render one account,
+    # so do not treat omitted siblings as deselected.
+    selected_ids = _selected_account_ids_from_request(request)
+    delete_qs = post.platform_posts.all()
+    scoped_account_id = _scoped_account_id_from_request(request)
+    if scoped_account_id:
+        delete_qs = delete_qs.filter(social_account_id=scoped_account_id)
+    delete_qs.exclude(social_account_id__in=selected_ids).delete()
     for acc_id in selected_ids:
         PlatformPost.objects.get_or_create(
             post=post,
