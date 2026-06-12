@@ -12,6 +12,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from apps.accounts.models import User
+from apps.approvals.models import ApprovalAction
 from apps.common.validators import (
     MAX_TAG_LENGTH,
     MAX_TAGS,
@@ -309,6 +310,78 @@ class ScopedComposerEditTests(TestCase):
         self.pp_b.refresh_from_db()
         self.assertEqual(self.pp_a.status, PlatformPost.Status.SCHEDULED)
         self.assertEqual(self.pp_b.scheduled_at, original_sibling_schedule)
+
+    def test_scoped_schedule_materializes_omitted_sibling_parent_fallback(self):
+        original_parent_schedule = timezone.now() + timedelta(days=2)
+        self.post.scheduled_at = original_parent_schedule
+        self.post.save(update_fields=["scheduled_at"])
+        self.pp_b.scheduled_at = None
+        self.pp_b.save(update_fields=["scheduled_at"])
+        scheduled_for = timezone.now() + timedelta(days=3)
+
+        response = self.client.post(
+            self._save_url(),
+            data=self._payload(
+                {
+                    "action": "schedule",
+                    "account_scope": str(self.account_a.id),
+                    "scheduled_date": scheduled_for.date().isoformat(),
+                    "scheduled_time": scheduled_for.strftime("%H:%M"),
+                }
+            ),
+        )
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.pp_b.refresh_from_db()
+        self.assertEqual(self.pp_b.scheduled_at, original_parent_schedule)
+
+    def test_scoped_submit_for_approval_only_moves_selected_platform_post(self):
+        self.pp_a.status = PlatformPost.Status.DRAFT
+        self.pp_a.save(update_fields=["status"])
+        self.pp_b.status = PlatformPost.Status.DRAFT
+        self.pp_b.save(update_fields=["status"])
+
+        response = self.client.post(
+            self._save_url(),
+            data=self._payload(
+                {
+                    "action": "submit_for_approval",
+                    "account_scope": str(self.account_a.id),
+                }
+            ),
+        )
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.pp_a.refresh_from_db()
+        self.pp_b.refresh_from_db()
+        self.assertEqual(self.pp_a.status, PlatformPost.Status.PENDING_REVIEW)
+        self.assertEqual(self.pp_b.status, PlatformPost.Status.DRAFT)
+        action = ApprovalAction.objects.get(post=self.post)
+        self.assertEqual(action.platform_post_id, self.pp_a.id)
+
+    def test_scoped_resubmit_for_approval_only_moves_selected_platform_post(self):
+        self.pp_a.status = PlatformPost.Status.CHANGES_REQUESTED
+        self.pp_a.save(update_fields=["status"])
+        self.pp_b.status = PlatformPost.Status.CHANGES_REQUESTED
+        self.pp_b.save(update_fields=["status"])
+
+        response = self.client.post(
+            self._save_url(),
+            data=self._payload(
+                {
+                    "action": "resubmit_for_approval",
+                    "account_scope": str(self.account_a.id),
+                }
+            ),
+        )
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.pp_a.refresh_from_db()
+        self.pp_b.refresh_from_db()
+        self.assertEqual(self.pp_a.status, PlatformPost.Status.PENDING_REVIEW)
+        self.assertEqual(self.pp_b.status, PlatformPost.Status.CHANGES_REQUESTED)
+        action = ApprovalAction.objects.get(post=self.post)
+        self.assertEqual(action.platform_post_id, self.pp_a.id)
 
     def test_unscoped_save_still_removes_deselected_platform_posts(self):
         response = self.client.post(self._save_url(), data=self._payload())

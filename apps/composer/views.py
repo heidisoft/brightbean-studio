@@ -163,6 +163,35 @@ def _platform_posts_for_schedule_propagation(request, post):
     return qs
 
 
+def _approval_target_for_request(request, post):
+    """Return the approval service target for this form submission."""
+    scoped_account_id = _scoped_account_id_from_request(request)
+    if not scoped_account_id:
+        return post
+    selected_ids = _selected_account_ids_from_request(request)
+    if scoped_account_id not in selected_ids:
+        return None
+    return post.platform_posts.filter(social_account_id=scoped_account_id).first()
+
+
+def _materialize_omitted_scoped_fallback_schedules(request, post, fallback_scheduled_at):
+    """Freeze omitted scheduled siblings before a scoped edit changes the parent.
+
+    Some older PlatformPost rows rely on ``Post.scheduled_at`` through the
+    Coalesce fallback used by calendar and publisher queries. If a scoped edit
+    changes the parent schedule, omitted siblings with NULL child schedules
+    would inherit the scoped account's new time. Materialize their previous
+    effective time before the parent changes.
+    """
+    if not post.pk or not fallback_scheduled_at or not _scoped_account_id_from_request(request):
+        return
+    selected_ids = _selected_account_ids_from_request(request)
+    post.platform_posts.filter(
+        status=PlatformPost.Status.SCHEDULED,
+        scheduled_at__isnull=True,
+    ).exclude(social_account_id__in=selected_ids).update(scheduled_at=fallback_scheduled_at)
+
+
 def _save_version(post, user):
     """Create a PostVersion snapshot."""
     version_number = (post.versions.count()) + 1
@@ -665,9 +694,11 @@ def save_post(request, workspace_id, post_id=None):
     """Save or update a post (draft, schedule, or publish action)."""
     workspace = _get_workspace(request, workspace_id)
     action = request.POST.get("action", "save_draft")
+    original_scheduled_at = None
 
     if post_id:
         post = get_object_or_404(Post, id=post_id, workspace=workspace)
+        original_scheduled_at = post.scheduled_at
         # Enforce edit permissions: authors can edit their own, others need edit_others_posts
         membership = request.workspace_membership
         perms = membership.effective_permissions if membership else {}
@@ -690,6 +721,8 @@ def save_post(request, workspace_id, post_id=None):
     # which is why we sync those before/after running it.
     pending_target = None  # what to transition existing children to after sync
     initial_status = "draft"  # default status for newly created PlatformPosts
+    if action in ("schedule", "publish_now", "add_to_queue", "add_to_queue_priority"):
+        _materialize_omitted_scoped_fallback_schedules(request, post, original_scheduled_at)
 
     if action == "schedule":
         sched_date = form.cleaned_data.get("scheduled_date")
@@ -785,7 +818,9 @@ def save_post(request, workspace_id, post_id=None):
         _save_version(post, request.user)
         from apps.approvals.services import submit_for_review
 
-        submit_for_review(post, request.user, workspace)
+        approval_target = _approval_target_for_request(request, post)
+        if approval_target is not None:
+            submit_for_review(approval_target, request.user, workspace)
         if request.htmx:
             return HttpResponse(
                 status=204,
@@ -802,7 +837,9 @@ def save_post(request, workspace_id, post_id=None):
         _save_version(post, request.user)
         from apps.approvals.services import resubmit_post
 
-        resubmit_post(post, request.user, workspace)
+        approval_target = _approval_target_for_request(request, post)
+        if approval_target is not None:
+            resubmit_post(approval_target, request.user, workspace)
         if request.htmx:
             return HttpResponse(
                 status=204,
