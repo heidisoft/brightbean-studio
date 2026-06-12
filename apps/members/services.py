@@ -8,7 +8,6 @@ from django.core.mail import EmailMultiAlternatives
 from django.template.loader import render_to_string
 from django.utils import timezone
 
-from apps.credentials.email import get_email_connection_for_org, get_from_email_for_org
 from apps.workspaces.models import Workspace
 
 from .models import Invitation, OrgMembership, WorkspaceMembership
@@ -385,9 +384,8 @@ def _send_invite_email(invitation):
     msg = EmailMultiAlternatives(
         subject=subject,
         body=text_content,
-        from_email=get_from_email_for_org(invitation.organization),
+        from_email=getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@localhost"),
         to=[invitation.email],
-        connection=get_email_connection_for_org(invitation.organization),
     )
     msg.attach_alternative(html_content, "text/html")
 

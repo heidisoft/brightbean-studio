@@ -349,7 +349,14 @@ brightbean-studio/
 
 ## Platform Credentials
 
-To connect social media accounts, you need API credentials from each platform's developer portal. You can set these via environment variables in `.env` (see `.env.example`) or through the admin UI at **Settings → Platform Credentials**.
+To connect social media accounts, you need API credentials from each platform's developer portal. You can set these via environment variables in `.env` (see `.env.example`) or, per organization, through the Django admin at `{APP_URL}/admin/` → **Credentials → Platform credentials** (superuser only). If a platform is configured in both places, the `.env` value takes precedence.
+
+**Admin UI access (superuser only):** The Django admin at `{APP_URL}/admin/` (for example `https://brightbean.example.com/admin/`) is restricted to superuser accounts — only a superuser can view or edit platform credentials there. If you don't already have one, create a superuser, then sign in and open **Credentials → Platform credentials**:
+
+```bash
+python manage.py createsuperuser
+# Docker: docker compose exec app python manage.py createsuperuser
+```
 
 **Redirect URI:** When registering your app on any platform, set the OAuth redirect URI to:
 
@@ -616,7 +623,18 @@ The MCP server lives at `POST {APP_URL}/api/v1/mcp` and speaks JSON-RPC 2.0 over
 | `get_account_analytics` | Channel analytics over a rolling 7–90 day window | `view_analytics` |
 | `get_post_analytics` | Per-platform metrics for a single post (safe for polling drafts) | `view_analytics` |
 
-To connect a client (Claude Desktop, Cursor, a custom agent), point it at `{APP_URL}/api/v1/mcp` and send the Bearer token in the `Authorization` header.
+### Connecting an MCP client
+
+The server is at `{APP_URL}/api/v1/mcp` and supports two authentication modes — pick whichever your client uses.
+
+**Claude Desktop (and other native OAuth connectors).** In Claude Desktop open **Settings → Connectors → Add custom connector**, name it, and enter the server URL `{APP_URL}/api/v1/mcp`. Claude registers itself (Dynamic Client Registration) and opens a browser to log in to BrightBean Studio and approve access — **no API key required**. Any Studio user can connect; the connection acts with **their own** workspace permissions (read-only roles get the read tools, while posting/scheduling/uploading require the matching permission), operating on their last-active workspace. Requires Studio to be served over a public **https** URL.
+
+**Claude Code, Cursor, custom agents (static API key).** Point the client at the same URL and send an API key as a Bearer token (`Authorization: Bearer bb_studio_...`). For Claude Code:
+
+```bash
+claude mcp add --transport http brightbean {APP_URL}/api/v1/mcp \
+  --header "Authorization: Bearer bb_studio_..."
+```
 
 ### Pre-built agent skill
 
