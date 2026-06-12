@@ -20,7 +20,7 @@ from django.template.loader import render_to_string
 from django.utils import timezone
 from django.utils.html import strip_tags
 from django.views.decorators.cache import never_cache
-from django.views.decorators.http import require_GET, require_POST, require_http_methods
+from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from apps.common.validators import (
     is_safe_url,
@@ -209,7 +209,7 @@ def _reassign_queue_slots_from_floor(queues, post, floor_date, workspace):
     each platform to pick its earliest available slot starting that day,
     independently.
     """
-    from apps.calendar.services import _next_slot_datetimes
+    from apps.calendar.services import next_available_slot_datetimes
     from apps.composer.services import sync_post_scheduled_at
 
     ws_tz = workspace.effective_timezone or "UTC"
@@ -220,7 +220,12 @@ def _reassign_queue_slots_from_floor(queues, post, floor_date, workspace):
     floor_dt = max(floor_dt, timezone.now())
 
     for q in queues:
-        slots = _next_slot_datetimes(q.social_account, floor_dt, count=1)
+        slots = next_available_slot_datetimes(
+            q.social_account,
+            floor_dt,
+            count=1,
+            exclude_post_ids=[post.id],
+        )
         if not slots:
             continue
         pp = post.platform_posts.filter(social_account=q.social_account).first()
@@ -613,9 +618,7 @@ def _delete_remote_platform_posts(platform_posts):
                 pp.platform_post_id,
                 exc,
             )
-            errors.append(
-                f"{account_name} ({pp.social_account.get_platform_display()}): {exc}"
-            )
+            errors.append(f"{account_name} ({pp.social_account.get_platform_display()}): {exc}")
     return errors
 
 

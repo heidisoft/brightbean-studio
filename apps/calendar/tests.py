@@ -1,15 +1,17 @@
 """Tests for the Content Calendar app (T-1A.2)."""
 
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 from django.utils import timezone
 
 from apps.accounts.models import User
 from apps.calendar.models import PostingSlot, Queue, QueueEntry
+from apps.calendar.services import add_to_queue
 from apps.composer.models import PlatformPost, Post
 from apps.members.models import OrgMembership, WorkspaceMembership
 from apps.organizations.models import Organization
@@ -43,6 +45,17 @@ class PostingSlotModelTest(TestCase):
         slot = PostingSlot()
         slot.day_of_week = 4
         self.assertEqual(slot.day_name, "Friday")
+
+
+class PostingSlotGridTemplateTests(SimpleTestCase):
+    """Posting slot grids should refresh after HTMX slot actions."""
+
+    def test_grid_listens_for_slots_updated_without_fragile_filter(self):
+        template_path = Path("templates/social_accounts/partials/_posting_slots_grid.html")
+        body = template_path.read_text()
+
+        self.assertIn('hx-trigger="slotsUpdated from:body"', body)
+        self.assertNotIn("slotsUpdated[", body)
 
 
 class QueueSchedulingServiceTests(TestCase):
@@ -280,6 +293,155 @@ class PostingSlotCrossWorkspaceTests(TestCase):
         self.assertEqual(slot_a2.time, time(11, 0))
 
 
+class QueueSlotAssignmentTests(TestCase):
+    """Regression tests for per-account next available slot assignment."""
+
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org")
+        self.workspace = Workspace.objects.create(organization=self.org, name="Workspace")
+        self.account_a = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform="facebook",
+            account_platform_id="page-a",
+            account_name="Page A",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        self.account_b = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform="facebook",
+            account_platform_id="page-b",
+            account_name="Page B",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+
+        now = timezone.now()
+        self.first_slot = self._future_slot_datetime(now, days=1, slot_time=time(9, 0))
+        self.second_slot = self._future_slot_datetime(now, days=2, slot_time=time(9, 0))
+        self.account_b_first_slot = self._future_slot_datetime(now, days=1, slot_time=time(14, 0))
+        self.account_b_second_slot = self._future_slot_datetime(now, days=2, slot_time=time(14, 0))
+
+        PostingSlot.objects.create(
+            social_account=self.account_a,
+            day_of_week=self.first_slot.weekday(),
+            time=self.first_slot.time(),
+        )
+        PostingSlot.objects.create(
+            social_account=self.account_a,
+            day_of_week=self.second_slot.weekday(),
+            time=self.second_slot.time(),
+        )
+        PostingSlot.objects.create(
+            social_account=self.account_b,
+            day_of_week=self.account_b_first_slot.weekday(),
+            time=self.account_b_first_slot.time(),
+        )
+        PostingSlot.objects.create(
+            social_account=self.account_b,
+            day_of_week=self.account_b_second_slot.weekday(),
+            time=self.account_b_second_slot.time(),
+        )
+
+        self.queue_a = Queue.objects.create(
+            workspace=self.workspace,
+            name="Page A Queue",
+            social_account=self.account_a,
+        )
+        self.queue_b = Queue.objects.create(
+            workspace=self.workspace,
+            name="Page B Queue",
+            social_account=self.account_b,
+        )
+
+    def _future_slot_datetime(self, now, *, days, slot_time):
+        slot_date = (now + timedelta(days=days)).date()
+        return datetime.combine(slot_date, slot_time).replace(tzinfo=now.tzinfo)
+
+    def _post_for_accounts(self, *accounts, caption="Queued"):
+        post = Post.objects.create(workspace=self.workspace, caption=caption)
+        for account in accounts:
+            PlatformPost.objects.create(
+                post=post,
+                social_account=account,
+                status=PlatformPost.Status.DRAFT,
+            )
+        return post
+
+    def test_add_to_queue_skips_slot_already_scheduled_for_same_account(self):
+        occupied_post = Post.objects.create(
+            workspace=self.workspace,
+            caption="Already scheduled",
+            scheduled_at=self.first_slot,
+        )
+        PlatformPost.objects.create(
+            post=occupied_post,
+            social_account=self.account_a,
+            status=PlatformPost.Status.SCHEDULED,
+            scheduled_at=self.first_slot,
+        )
+        queued_post = self._post_for_accounts(self.account_a)
+
+        add_to_queue(queued_post, self.queue_a)
+
+        platform_post = queued_post.platform_posts.get(social_account=self.account_a)
+        self.assertEqual(platform_post.scheduled_at, self.second_slot)
+        self.assertEqual(queued_post.queue_entries.get(queue=self.queue_a).assigned_slot_datetime, self.second_slot)
+        queued_post.refresh_from_db()
+        self.assertEqual(queued_post.scheduled_at, self.second_slot)
+
+    def test_add_to_multiple_account_queues_uses_each_accounts_available_slots(self):
+        occupied_post = Post.objects.create(
+            workspace=self.workspace,
+            caption="Page A already scheduled",
+            scheduled_at=self.first_slot,
+        )
+        PlatformPost.objects.create(
+            post=occupied_post,
+            social_account=self.account_a,
+            status=PlatformPost.Status.SCHEDULED,
+            scheduled_at=self.first_slot,
+        )
+        queued_post = self._post_for_accounts(self.account_a, self.account_b)
+
+        add_to_queue(queued_post, self.queue_a)
+        add_to_queue(queued_post, self.queue_b)
+
+        page_a_post = queued_post.platform_posts.get(social_account=self.account_a)
+        page_b_post = queued_post.platform_posts.get(social_account=self.account_b)
+        self.assertEqual(page_a_post.scheduled_at, self.second_slot)
+        self.assertEqual(page_b_post.scheduled_at, self.account_b_first_slot)
+        queued_post.refresh_from_db()
+        self.assertEqual(queued_post.scheduled_at, self.account_b_first_slot)
+
+    def test_published_queue_entry_is_not_moved_to_future_slot(self):
+        published_post = Post.objects.create(
+            workspace=self.workspace,
+            caption="Already published",
+            scheduled_at=self.first_slot,
+            published_at=timezone.now(),
+        )
+        published_platform_post = PlatformPost.objects.create(
+            post=published_post,
+            social_account=self.account_a,
+            status=PlatformPost.Status.PUBLISHED,
+            scheduled_at=self.first_slot,
+            published_at=timezone.now(),
+        )
+
+        add_to_queue(published_post, self.queue_a)
+
+        published_platform_post.refresh_from_db()
+        published_post.refresh_from_db()
+        self.assertEqual(published_platform_post.scheduled_at, self.first_slot)
+        self.assertEqual(published_post.scheduled_at, self.first_slot)
+        self.assertIsNone(published_post.queue_entries.get(queue=self.queue_a).assigned_slot_datetime)
+
+        queued_post = self._post_for_accounts(self.account_a)
+        add_to_queue(queued_post, self.queue_a)
+
+        queued_platform_post = queued_post.platform_posts.get(social_account=self.account_a)
+        self.assertEqual(queued_platform_post.scheduled_at, self.first_slot)
+
+
 class PostingSlotCopyTests(TestCase):
     """Copying an account schedule should replace only the target account's slots."""
 
@@ -350,10 +512,13 @@ class PostingSlotCopyTests(TestCase):
         target_slots = list(
             PostingSlot.objects.filter(social_account=self.target_account).order_by("day_of_week", "time")
         )
-        self.assertEqual([(slot.day_of_week, slot.time, slot.is_active) for slot in target_slots], [
-            (PostingSlot.DayOfWeek.MONDAY, time(9, 0), True),
-            (PostingSlot.DayOfWeek.FRIDAY, time(16, 30), False),
-        ])
+        self.assertEqual(
+            [(slot.day_of_week, slot.time, slot.is_active) for slot in target_slots],
+            [
+                (PostingSlot.DayOfWeek.MONDAY, time(9, 0), True),
+                (PostingSlot.DayOfWeek.FRIDAY, time(16, 30), False),
+            ],
+        )
 
     def test_copy_empty_source_clears_target_schedule(self):
         PostingSlot.objects.create(

@@ -145,7 +145,6 @@ class SocialProvider(ABC):
         """Delete an existing published post on the platform."""
         raise NotImplementedError(f"{self.platform_name} does not support deleting published posts")
 
-
     # ------------------------------------------------------------------
     # Analytics (optional - override per provider)
     # ------------------------------------------------------------------

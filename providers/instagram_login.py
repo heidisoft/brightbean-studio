@@ -384,10 +384,7 @@ class InstagramLoginProvider(SocialProvider):
         )
 
     def delete_post(self, access_token: str, post_id: str) -> bool:
-        raise NotImplementedError(
-            "Instagram does not support deleting already-published media through the API."
-        )
-
+        raise NotImplementedError("Instagram does not support deleting already-published media through the API.")
 
     # ------------------------------------------------------------------
     # Comments

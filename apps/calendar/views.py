@@ -880,9 +880,7 @@ def copy_posting_slots(request, workspace_id):
         workspace=workspace,
     )
 
-    source_slots = list(
-        PostingSlot.objects.filter(social_account=source_account).order_by("day_of_week", "time")
-    )
+    source_slots = list(PostingSlot.objects.filter(social_account=source_account).order_by("day_of_week", "time"))
     copied_slots = [
         PostingSlot(
             social_account=target_account,

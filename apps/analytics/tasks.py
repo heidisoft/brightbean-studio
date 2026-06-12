@@ -481,7 +481,7 @@ def _sync_account_metrics(account, on_date: dt_date) -> None:
             metrics = _call_with_analytics_token(
                 account,
                 provider,
-                lambda access_token: provider.get_account_metrics(access_token, (start, end)),
+                lambda access_token, start=start, end=end: provider.get_account_metrics(access_token, (start, end)),
             )
         except NotImplementedError:
             return

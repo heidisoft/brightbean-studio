@@ -43,6 +43,7 @@ def _is_invalid_insights_metric_error(exc: APIError) -> bool:
         "valid insights metric" in message or "must be one of the following values" in message
     )
 
+
 # Polling settings for container status checks
 CONTAINER_POLL_INTERVAL = 2  # seconds
 CONTAINER_POLL_MAX_ATTEMPTS = 60
@@ -385,10 +386,7 @@ class InstagramProvider(SocialProvider):
         )
 
     def delete_post(self, access_token: str, post_id: str) -> bool:
-        raise NotImplementedError(
-            "Instagram does not support deleting already-published media through the Graph API."
-        )
-
+        raise NotImplementedError("Instagram does not support deleting already-published media through the Graph API.")
 
     # ------------------------------------------------------------------
     # Comments

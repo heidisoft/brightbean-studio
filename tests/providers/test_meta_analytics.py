@@ -1,6 +1,6 @@
 """Tests for Meta analytics metric compatibility handling."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 from providers.exceptions import APIError
@@ -71,6 +71,7 @@ class TestInstagramAnalyticsMetrics:
             _response({"data": [{"name": "likes", "values": [{"value": 7}]}]}),
             _response({"data": [{"name": "comments", "values": [{"value": 2}]}]}),
             _response({"data": [{"name": "shares", "values": [{"value": 1}]}]}),
+            _response({"data": [{"name": "profile_visits", "values": [{"value": 5}]}]}),
             _response({"data": [{"name": "total_interactions", "values": [{"value": 13}]}]}),
         ]
 
@@ -82,6 +83,7 @@ class TestInstagramAnalyticsMetrics:
         assert metrics.likes == 7
         assert metrics.comments == 2
         assert metrics.shares == 1
+        assert metrics.extra["profile_visits"] == 5
         assert metrics.extra["total_interactions"] == 13
         requested = [kwargs["params"]["metric"] for _args, kwargs in mock_request.call_args_list]
         assert "engagement" not in requested
@@ -99,7 +101,7 @@ class TestInstagramAnalyticsMetrics:
 
         metrics = InstagramProvider({"ig_user_id": "ig-user"}).get_account_metrics(
             "token",
-            (datetime(2026, 6, 7, tzinfo=timezone.utc), datetime(2026, 6, 8, tzinfo=timezone.utc)),
+            (datetime(2026, 6, 7, tzinfo=UTC), datetime(2026, 6, 8, tzinfo=UTC)),
         )
 
         assert metrics.impressions == 50
@@ -149,7 +151,7 @@ class TestInstagramDirectAnalyticsMetrics:
 
         metrics = InstagramLoginProvider().get_account_metrics(
             "token",
-            (datetime(2026, 6, 7, tzinfo=timezone.utc), datetime(2026, 6, 8, tzinfo=timezone.utc)),
+            (datetime(2026, 6, 7, tzinfo=UTC), datetime(2026, 6, 8, tzinfo=UTC)),
         )
 
         assert metrics.impressions == 50

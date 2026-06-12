@@ -351,7 +351,9 @@ class FacebookProvider(SocialProvider):
         summary = self._get_post_summary_counts(access_token, post_id)
 
         reactions = values.get("post_reactions_by_type_total", {})
-        total_reactions = sum(v for v in reactions.values() if isinstance(v, int | float)) if isinstance(reactions, dict) else 0
+        total_reactions = (
+            int(sum(v for v in reactions.values() if isinstance(v, int | float))) if isinstance(reactions, dict) else 0
+        )
 
         return PostMetrics(
             impressions=values.get("post_impressions", 0),
