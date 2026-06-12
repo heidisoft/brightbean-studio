@@ -1,7 +1,7 @@
 """Tests for analytics sync OAuth token handling."""
 
-from types import SimpleNamespace
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from django.utils import timezone

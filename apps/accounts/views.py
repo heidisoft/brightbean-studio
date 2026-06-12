@@ -94,12 +94,14 @@ def account_settings(request):
         for et_value, et_label in event_types:
             channel_list = []
             for ch_value, ch_label in channels:
-                channel_list.append({
-                    "value": ch_value,
-                    "label": ch_label,
-                    "field_name": f"notif_{et_value}_{ch_value}",
-                    "is_enabled": pref_lookup.get((et_value, ch_value), True),
-                })
+                channel_list.append(
+                    {
+                        "value": ch_value,
+                        "label": ch_label,
+                        "field_name": f"notif_{et_value}_{ch_value}",
+                        "is_enabled": pref_lookup.get((et_value, ch_value), True),
+                    }
+                )
             notification_prefs.append({"event_type": et_value, "label": et_label, "channel_list": channel_list})
 
         context["notification_prefs"] = notification_prefs

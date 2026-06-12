@@ -1,6 +1,6 @@
 """Tests for Meta analytics metric compatibility handling."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 from providers.exceptions import APIError
@@ -99,7 +99,7 @@ class TestInstagramAnalyticsMetrics:
 
         metrics = InstagramProvider({"ig_user_id": "ig-user"}).get_account_metrics(
             "token",
-            (datetime(2026, 6, 7, tzinfo=timezone.utc), datetime(2026, 6, 8, tzinfo=timezone.utc)),
+            (datetime(2026, 6, 7, tzinfo=UTC), datetime(2026, 6, 8, tzinfo=UTC)),
         )
 
         assert metrics.impressions == 50
@@ -149,7 +149,7 @@ class TestInstagramDirectAnalyticsMetrics:
 
         metrics = InstagramLoginProvider().get_account_metrics(
             "token",
-            (datetime(2026, 6, 7, tzinfo=timezone.utc), datetime(2026, 6, 8, tzinfo=timezone.utc)),
+            (datetime(2026, 6, 7, tzinfo=UTC), datetime(2026, 6, 8, tzinfo=UTC)),
         )
 
         assert metrics.impressions == 50

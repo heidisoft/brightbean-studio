@@ -618,9 +618,7 @@ def _delete_remote_platform_posts(platform_posts):
                 pp.platform_post_id,
                 exc,
             )
-            errors.append(
-                f"{account_name} ({pp.social_account.get_platform_display()}): {exc}"
-            )
+            errors.append(f"{account_name} ({pp.social_account.get_platform_display()}): {exc}")
     return errors
 
 

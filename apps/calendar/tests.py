@@ -512,10 +512,13 @@ class PostingSlotCopyTests(TestCase):
         target_slots = list(
             PostingSlot.objects.filter(social_account=self.target_account).order_by("day_of_week", "time")
         )
-        self.assertEqual([(slot.day_of_week, slot.time, slot.is_active) for slot in target_slots], [
-            (PostingSlot.DayOfWeek.MONDAY, time(9, 0), True),
-            (PostingSlot.DayOfWeek.FRIDAY, time(16, 30), False),
-        ])
+        self.assertEqual(
+            [(slot.day_of_week, slot.time, slot.is_active) for slot in target_slots],
+            [
+                (PostingSlot.DayOfWeek.MONDAY, time(9, 0), True),
+                (PostingSlot.DayOfWeek.FRIDAY, time(16, 30), False),
+            ],
+        )
 
     def test_copy_empty_source_clears_target_schedule(self):
         PostingSlot.objects.create(
