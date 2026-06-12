@@ -4,6 +4,7 @@ Verifies that excess tags are silently truncated and that XSS payloads survive
 to storage and render escaped.
 """
 
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 from django.test import TestCase
@@ -187,6 +188,134 @@ class YouTubePlatformTagsTests(TestCase):
         total = sum(len(t) for t in stored_tags) + max(0, len(stored_tags) - 1)
         self.assertLessEqual(total, MAX_YT_TAGS_TOTAL_CHARS)
         self.assertGreater(len(stored_tags), 0)
+
+
+class ScopedComposerEditTests(TestCase):
+    """Scoped account edits must not drop sibling PlatformPost rows."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="owner@example.com",
+            password="testpass123",
+            tos_accepted_at=timezone.now(),
+        )
+        self.org = Organization.objects.create(name="Test Org")
+        self.workspace = Workspace.objects.create(organization=self.org, name="Test Workspace")
+        OrgMembership.objects.create(
+            user=self.user,
+            organization=self.org,
+            org_role=OrgMembership.OrgRole.OWNER,
+        )
+        WorkspaceMembership.objects.create(
+            user=self.user,
+            workspace=self.workspace,
+            workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
+        )
+        self.account_a = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform="facebook",
+            account_platform_id="fb-1",
+            account_name="Facebook Page",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        self.account_b = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform="linkedin_company",
+            account_platform_id="li-1",
+            account_name="LinkedIn Page",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        self.post = Post.objects.create(
+            workspace=self.workspace,
+            author=self.user,
+            title="Original title",
+            caption="Original caption",
+        )
+        self.pp_a = PlatformPost.objects.create(
+            post=self.post,
+            social_account=self.account_a,
+            status=PlatformPost.Status.SCHEDULED,
+            scheduled_at=timezone.now() + timedelta(days=1),
+        )
+        self.pp_b = PlatformPost.objects.create(
+            post=self.post,
+            social_account=self.account_b,
+            status=PlatformPost.Status.SCHEDULED,
+            scheduled_at=timezone.now() + timedelta(days=2),
+        )
+        self.client.force_login(self.user)
+
+    def _save_url(self):
+        return reverse(
+            "composer:save_post_edit",
+            kwargs={"workspace_id": self.workspace.id, "post_id": self.post.id},
+        )
+
+    def _autosave_url(self):
+        return reverse(
+            "composer:autosave_edit",
+            kwargs={"workspace_id": self.workspace.id, "post_id": self.post.id},
+        )
+
+    def _payload(self, extra=None):
+        payload = {
+            "action": "save_draft",
+            "title": "Edited title",
+            "caption": "Edited caption",
+            "tags": "",
+            "selected_accounts": str(self.account_a.id),
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def test_scoped_save_preserves_other_platform_posts(self):
+        response = self.client.post(
+            self._save_url(),
+            data=self._payload({"account_scope": str(self.account_a.id)}),
+        )
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.assertTrue(PlatformPost.objects.filter(id=self.pp_a.id).exists())
+        self.assertTrue(PlatformPost.objects.filter(id=self.pp_b.id).exists())
+
+    def test_scoped_autosave_preserves_other_platform_posts(self):
+        response = self.client.post(
+            self._autosave_url(),
+            data=self._payload({"account_scope": str(self.account_a.id)}),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(PlatformPost.objects.filter(id=self.pp_a.id).exists())
+        self.assertTrue(PlatformPost.objects.filter(id=self.pp_b.id).exists())
+
+    def test_scoped_schedule_preserves_other_platform_schedule(self):
+        original_sibling_schedule = self.pp_b.scheduled_at
+        scheduled_for = timezone.now() + timedelta(days=3)
+        response = self.client.post(
+            self._save_url(),
+            data=self._payload(
+                {
+                    "action": "schedule",
+                    "account_scope": str(self.account_a.id),
+                    "scheduled_date": scheduled_for.date().isoformat(),
+                    "scheduled_time": scheduled_for.strftime("%H:%M"),
+                }
+            ),
+        )
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.pp_a.refresh_from_db()
+        self.pp_b.refresh_from_db()
+        self.assertEqual(self.pp_a.status, PlatformPost.Status.SCHEDULED)
+        self.assertEqual(self.pp_b.scheduled_at, original_sibling_schedule)
+
+    def test_unscoped_save_still_removes_deselected_platform_posts(self):
+        response = self.client.post(self._save_url(), data=self._payload())
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.assertTrue(PlatformPost.objects.filter(id=self.pp_a.id).exists())
+        self.assertFalse(PlatformPost.objects.filter(id=self.pp_b.id).exists())
 
 
 class PublishedPostDeleteTests(TestCase):

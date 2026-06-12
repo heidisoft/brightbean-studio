@@ -301,6 +301,9 @@
               class="flex flex-col flex-1 min-h-0">
             {% csrf_token %}
             <input type="hidden" name="selected_accounts" :value="selectedAccounts.join(',')">
+            {% if account_filter %}
+            <input type="hidden" name="account_scope" value="{{ account_filter }}">
+            {% endif %}
 
             <div class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4 sm:space-y-5 panel-scroll relative" style="z-index: 0;">
 
