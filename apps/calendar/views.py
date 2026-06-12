@@ -7,6 +7,7 @@ from datetime import date, datetime, time, timedelta
 
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.db.models import QuerySet
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -842,6 +843,54 @@ def posting_slots(request, workspace_id):
         "day_choices": PostingSlot.DayOfWeek.choices,
     }
     return render(request, "calendar/posting_slots.html", context)
+
+
+@login_required
+@require_POST
+@require_permission("manage_social_accounts")
+def copy_posting_slots(request, workspace_id):
+    """Replace one account's posting slots with another account's schedule."""
+    workspace = _get_workspace(request, workspace_id)
+    target_account_id = request.POST.get("target_social_account_id")
+    source_account_id = request.POST.get("source_social_account_id")
+
+    if not target_account_id or not source_account_id:
+        return JsonResponse({"error": "Choose a schedule to copy."}, status=400)
+
+    if target_account_id == source_account_id:
+        return JsonResponse({"error": "Choose a different account."}, status=400)
+
+    target_account = get_object_or_404(
+        SocialAccount,
+        id=target_account_id,
+        workspace=workspace,
+    )
+    source_account = get_object_or_404(
+        SocialAccount,
+        id=source_account_id,
+        workspace=workspace,
+    )
+
+    source_slots = list(
+        PostingSlot.objects.filter(social_account=source_account).order_by("day_of_week", "time")
+    )
+    copied_slots = [
+        PostingSlot(
+            social_account=target_account,
+            day_of_week=slot.day_of_week,
+            time=slot.time,
+            is_active=slot.is_active,
+        )
+        for slot in source_slots
+    ]
+
+    with transaction.atomic():
+        PostingSlot.objects.filter(social_account=target_account).delete()
+        PostingSlot.objects.bulk_create(copied_slots)
+
+    if request.htmx:
+        return _slots_updated_response(target_account.id)
+    return JsonResponse({"copied": len(copied_slots)})
 
 
 @login_required
