@@ -277,7 +277,7 @@ def _resolve_queues_for_post(queue_id, workspace, post_data):
 
 
 def _reassign_queue_slots_from_floor(queues, post, floor_date, workspace):
-    """Override per-platform scheduled_at for *post* with the next posting slot
+    """Override queued slot assignment for *post* using the next posting slot
     on/after *floor_date* for each queue's social account.
 
     Used when the composer was opened from a specific calendar day - we want
@@ -301,6 +301,10 @@ def _reassign_queue_slots_from_floor(queues, post, floor_date, workspace):
         pp = post.platform_posts.filter(social_account=q.social_account).first()
         if pp is None:
             continue
+        entry = post.queue_entries.filter(queue=q).first()
+        if entry is not None:
+            entry.assigned_slot_datetime = slots[0]
+            entry.save(update_fields=["assigned_slot_datetime"])
         pp.scheduled_at = slots[0]
         pp.save(update_fields=["scheduled_at", "updated_at"])
 

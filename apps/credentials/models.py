@@ -169,3 +169,117 @@ def resolve_app_secrets(*platforms):
         if secret and secret not in secrets:
             secrets.append(secret)
     return secrets
+
+
+class SmtpCredential(models.Model):
+    """Organization-scoped SMTP settings for transactional email."""
+
+    class TestResult(models.TextChoices):
+        SUCCESS = "success", "Success"
+        FAILURE = "failure", "Failure"
+        UNTESTED = "untested", "Untested"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.OneToOneField(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="smtp_credential",
+    )
+    credentials = EncryptedJSONField(
+        default=dict,
+        help_text="Encrypted JSON containing SMTP host, port, username, password, and sender details.",
+    )
+    is_configured = models.BooleanField(default=False)
+    tested_at = models.DateTimeField(blank=True, null=True)
+    test_result = models.CharField(
+        max_length=20,
+        choices=TestResult.choices,
+        default=TestResult.UNTESTED,
+    )
+    last_error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = OrgScopedManager()
+
+    class Meta:
+        db_table = "credentials_smtp_credential"
+
+    def __str__(self):
+        return f"{self.organization.name} - SMTP"
+
+    @property
+    def masked_credentials(self):
+        masked = {}
+        for key, value in (self.credentials or {}).items():
+            if key == "password" and value:
+                masked[key] = "****" + str(value)[-4:]
+            else:
+                masked[key] = value
+        return masked
+
+    @property
+    def from_email(self):
+        return (self.credentials or {}).get("from_email", "")
+
+    def connection_kwargs(self):
+        data = self.credentials or {}
+        return {
+            "backend": "django.core.mail.backends.smtp.EmailBackend",
+            "host": data.get("host", ""),
+            "port": int(data.get("port") or 587),
+            "username": data.get("username", ""),
+            "password": data.get("password", ""),
+            "use_tls": bool(data.get("use_tls", True)),
+            "use_ssl": bool(data.get("use_ssl", False)),
+            "timeout": int(data.get("timeout") or 10),
+        }
+
+
+class SmtpTestLog(models.Model):
+    """Audit trail for SMTP test email attempts."""
+
+    class Status(models.TextChoices):
+        SUCCESS = "success", "Success"
+        FAILURE = "failure", "Failure"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="smtp_test_logs",
+    )
+    smtp_credential = models.ForeignKey(
+        SmtpCredential,
+        on_delete=models.SET_NULL,
+        related_name="test_logs",
+        blank=True,
+        null=True,
+    )
+    created_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.SET_NULL,
+        related_name="smtp_test_logs",
+        blank=True,
+        null=True,
+    )
+    recipient_email = models.EmailField()
+    from_email = models.EmailField()
+    host = models.CharField(max_length=255)
+    port = models.PositiveIntegerField(default=587)
+    status = models.CharField(max_length=20, choices=Status.choices)
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = OrgScopedManager()
+
+    class Meta:
+        db_table = "credentials_smtp_test_log"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["organization", "created_at"], name="idx_smtp_log_org_time"),
+            models.Index(fields=["status", "created_at"], name="idx_smtp_log_status"),
+        ]
+
+    def __str__(self):
+        return f"SMTP test {self.status} to {self.recipient_email}"

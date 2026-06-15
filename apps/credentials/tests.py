@@ -1,13 +1,13 @@
-"""Tests for platform credential resolution, derivation, the admin form, and the
-removal of the dormant /credentials/ placeholder."""
+"""Tests for platform credential resolution, derivation, admin forms, and URLs."""
 
 import pytest
 from django.test import override_settings
-from django.urls import NoReverseMatch, Resolver404, resolve, reverse
+from django.urls import resolve, reverse
 
-from apps.credentials.forms import PlatformCredentialAdminForm
+from apps.credentials.forms import PlatformCredentialAdminForm, SmtpCredentialForm
 from apps.credentials.models import (
     PlatformCredential,
+    SmtpCredential,
     derive_is_configured,
     resolve_app_secret,
     resolve_app_secrets,
@@ -219,18 +219,61 @@ def test_admin_form_excludes_credential_less_platforms():
 
 
 # ---------------------------------------------------------------------------
-# Dormant /credentials/ placeholder removed
+# Credentials settings URLs and SMTP form/model
 # ---------------------------------------------------------------------------
 
 
-def test_credentials_placeholder_url_removed():
-    with pytest.raises(Resolver404):
-        resolve("/credentials/")
+def test_credentials_urls_resolve():
+    assert resolve("/credentials/").view_name == "credentials:list"
+    assert reverse("credentials:smtp") == "/credentials/smtp/"
 
 
-def test_credentials_namespace_reverse_removed():
-    with pytest.raises(NoReverseMatch):
-        reverse("credentials:list")
+def test_smtp_form_rejects_tls_and_ssl_together():
+    form = SmtpCredentialForm(
+        data={
+            "from_email": "sender@example.com",
+            "host": "smtp.example.com",
+            "port": 587,
+            "username": "sender",
+            "password": "secret",
+            "use_tls": "on",
+            "use_ssl": "on",
+            "timeout": 10,
+            "is_configured": "on",
+        }
+    )
+    assert not form.is_valid()
+    assert "Use either TLS or SSL" in str(form.errors)
+
+
+@pytest.mark.django_db
+def test_smtp_credential_connection_kwargs(organization):
+    credential = SmtpCredential.objects.create(
+        organization=organization,
+        credentials={
+            "from_email": "sender@example.com",
+            "host": "smtp.example.com",
+            "port": "465",
+            "username": "sender",
+            "password": "secret",
+            "use_tls": False,
+            "use_ssl": True,
+            "timeout": "20",
+        },
+        is_configured=True,
+    )
+
+    assert credential.from_email == "sender@example.com"
+    assert credential.connection_kwargs() == {
+        "backend": "django.core.mail.backends.smtp.EmailBackend",
+        "host": "smtp.example.com",
+        "port": 465,
+        "username": "sender",
+        "password": "secret",
+        "use_tls": False,
+        "use_ssl": True,
+        "timeout": 20,
+    }
 
 
 # ---------------------------------------------------------------------------

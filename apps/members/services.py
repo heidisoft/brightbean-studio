@@ -384,8 +384,9 @@ def _send_invite_email(invitation):
     msg = EmailMultiAlternatives(
         subject=subject,
         body=text_content,
-        from_email=getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@localhost"),
+        from_email=_get_invite_from_email(invitation.organization),
         to=[invitation.email],
+        connection=_get_invite_email_connection(invitation.organization),
     )
     msg.attach_alternative(html_content, "text/html")
 
@@ -393,3 +394,15 @@ def _send_invite_email(invitation):
         msg.send(fail_silently=False)
     except Exception:
         logger.exception("Failed to send invite email to %s", invitation.email)
+
+
+def _get_invite_email_connection(organization):
+    from apps.credentials.email import get_email_connection_for_org
+
+    return get_email_connection_for_org(organization)
+
+
+def _get_invite_from_email(organization):
+    from apps.credentials.email import get_from_email_for_org
+
+    return get_from_email_for_org(organization)
