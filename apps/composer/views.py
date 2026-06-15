@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import logging
 import re
 import uuid
 from datetime import UTC, datetime
@@ -18,7 +19,8 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.utils import timezone
 from django.utils.html import strip_tags
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.cache import never_cache
+from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from apps.common.validators import (
     is_safe_url,
@@ -48,6 +50,10 @@ from .models import (
 )
 
 MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
+
+logger = logging.getLogger(__name__)
+
+REMOTE_DELETE_UNSUPPORTED_PLATFORMS = {"instagram", "instagram_login"}
 
 
 def _get_workspace(request, workspace_id):
@@ -130,7 +136,7 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
     ``"pending_review"``). Existing rows are not touched here — call
     ``_transition_post_children`` separately if you want to move them.
     """
-    selected_ids = _parse_selected_account_ids(request.POST.get("selected_accounts", ""))
+    selected_ids = _selected_account_ids_from_request(request)
     _remove_deselected_platform_posts(request, post, selected_ids)
     for acc_id in selected_ids:
         try:
@@ -202,6 +208,66 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
             pp.platform_extra = extra
 
         pp.save()
+
+
+def _selected_account_ids_from_request(request):
+    return _parse_selected_account_ids(request.POST.get("selected_accounts", ""))
+
+
+def _scoped_account_id_from_request(request):
+    """Return the optional account scope for single-channel composer edits.
+
+    Calendar/list chips open the composer with ``?account=...`` so the UI only
+    renders that one channel. The hidden ``account_scope`` field lets save and
+    autosave know that omitted sibling accounts were not part of the submitted
+    form and must not be deleted.
+    """
+    return _get_account_scope(request)
+
+
+def _scoped_target_platform_post_ids(request, post):
+    """Return PlatformPost IDs touched by a scoped form, or None for all."""
+    if not _scoped_account_id_from_request(request):
+        return None
+    selected_ids = _selected_account_ids_from_request(request)
+    return list(post.platform_posts.filter(social_account_id__in=selected_ids).values_list("id", flat=True))
+
+
+def _platform_posts_for_schedule_propagation(request, post):
+    qs = post.platform_posts.exclude(status__in=PlatformPost.PROTECTED_STATUSES)
+    if _scoped_account_id_from_request(request):
+        selected_ids = _selected_account_ids_from_request(request)
+        qs = qs.filter(social_account_id__in=selected_ids)
+    return qs
+
+
+def _approval_target_for_request(request, post):
+    """Return the approval service target for this form submission."""
+    scoped_account_id = _scoped_account_id_from_request(request)
+    if not scoped_account_id:
+        return post
+    selected_ids = _selected_account_ids_from_request(request)
+    if scoped_account_id not in selected_ids:
+        return None
+    return post.platform_posts.filter(social_account_id=scoped_account_id).first()
+
+
+def _materialize_omitted_scoped_fallback_schedules(request, post, fallback_scheduled_at):
+    """Freeze omitted scheduled siblings before a scoped edit changes the parent.
+
+    Some older PlatformPost rows rely on ``Post.scheduled_at`` through the
+    Coalesce fallback used by calendar and publisher queries. If a scoped edit
+    changes the parent schedule, omitted siblings with NULL child schedules
+    would inherit the scoped account's new time. Materialize their previous
+    effective time before the parent changes.
+    """
+    if not post.pk or not fallback_scheduled_at or not _scoped_account_id_from_request(request):
+        return
+    selected_ids = _selected_account_ids_from_request(request)
+    post.platform_posts.filter(
+        status=PlatformPost.Status.SCHEDULED,
+        scheduled_at__isnull=True,
+    ).exclude(social_account_id__in=selected_ids).update(scheduled_at=fallback_scheduled_at)
 
 
 def _save_version(post, user):
@@ -284,7 +350,7 @@ def _reassign_queue_slots_from_floor(queues, post, floor_date, workspace):
     each platform to pick its earliest available slot starting that day,
     independently.
     """
-    from apps.calendar.services import _next_slot_datetimes
+    from apps.calendar.services import next_available_slot_datetimes
     from apps.composer.services import sync_post_scheduled_at
 
     ws_tz = workspace.effective_timezone or "UTC"
@@ -295,7 +361,12 @@ def _reassign_queue_slots_from_floor(queues, post, floor_date, workspace):
     floor_dt = max(floor_dt, timezone.now())
 
     for q in queues:
-        slots = _next_slot_datetimes(q.social_account, floor_dt, count=1)
+        slots = next_available_slot_datetimes(
+            q.social_account,
+            floor_dt,
+            count=1,
+            exclude_post_ids=[post.id],
+        )
         if not slots:
             continue
         pp = post.platform_posts.filter(social_account=q.social_account).first()
@@ -346,6 +417,7 @@ def _resolve_template_data(template_id, workspace):
 
 @login_required
 @require_permission("create_posts")
+@never_cache
 def compose(request, workspace_id, post_id=None):
     """Render the full-page composer for creating or editing a post."""
     workspace = _get_workspace(request, workspace_id)
@@ -472,6 +544,27 @@ def compose(request, workspace_id, post_id=None):
     ws_role = membership.workspace_role if membership else None
     can_view_internal_notes = ws_role not in ("client", "viewer") if ws_role else True
 
+    # Template data pre-fill (if using a template)
+    template_id = request.GET.get("template")
+    template_data = None
+    if template_id and not post:
+        try:
+            tpl = PostTemplate.objects.get(id=template_id, workspace=workspace)
+            template_data = tpl.template_data
+        except (PostTemplate.DoesNotExist, ValidationError):
+            # Fall back to built-in template by integer ID
+            from apps.composer.builtin_templates import TEMPLATES as BUILTIN_TEMPLATES
+
+            builtin = next((t for t in BUILTIN_TEMPLATES if str(t["id"]) == template_id), None)
+            if builtin:
+                template_data = {"body": builtin.get("body", ""), "title": builtin.get("title", "")}
+
+    # Pre-fill caption from template data
+    if template_data and not post:
+        body = template_data.get("body", "")
+        if body:
+            form.initial["caption"] = body
+
     # Approval workflow context
     workflow_mode = workspace.approval_workflow_mode
     show_submit_button = workflow_mode != "none"
@@ -565,6 +658,7 @@ def compose(request, workspace_id, post_id=None):
         "workflow_mode": workflow_mode,
         "show_submit_button": show_submit_button,
         "show_resubmit_button": show_resubmit_button,
+        "remote_delete_summary": _remote_delete_summary(post),
         "approval_history": approval_history,
         "post_comments": post_comments,
         "pending_assets": pending_assets,
@@ -573,6 +667,7 @@ def compose(request, workspace_id, post_id=None):
         # that account — the save endpoints use this to leave siblings alone.
         "account_scope": account_filter if (post_id and account_filter) else "",
         "failed_platform_posts": failed_platform_posts,
+        "account_filter": account_filter,
     }
     return render(request, "composer/compose.html", context)
 
@@ -622,6 +717,74 @@ def _platform_status_map(post):
     return {str(pp.id): pp.status for pp in post.platform_posts.all()}
 
 
+def _remote_delete_summary(post):
+    """Build delete capability text for the post editor modal."""
+    if not post:
+        return {"supported": [], "unsupported": []}
+
+    supported = []
+    unsupported = []
+    for pp in post.platform_posts.select_related("social_account").filter(
+        status=PlatformPost.Status.PUBLISHED,
+    ):
+        account = pp.social_account
+        name = account.account_name or account.account_handle or account.get_platform_display()
+        label = f"{name} ({account.get_platform_display()})"
+        if account.platform in REMOTE_DELETE_UNSUPPORTED_PLATFORMS:
+            unsupported.append(label)
+        elif pp.platform_post_id:
+            supported.append(label)
+    return {"supported": supported, "unsupported": unsupported}
+
+
+def _delete_remote_platform_posts(platform_posts):
+    """Delete remote posts for local PlatformPosts that already published."""
+    from apps.publisher.engine import _resolve_publish_credentials
+    from providers import get_provider
+
+    errors = []
+    for pp in platform_posts:
+        if not pp.platform_post_id:
+            continue
+        account_name = pp.social_account.account_name or pp.social_account.account_handle
+        if pp.social_account.platform in REMOTE_DELETE_UNSUPPORTED_PLATFORMS:
+            logger.info(
+                "Remote delete skipped for PlatformPost %s on %s account %s (%s), remote id %s: unsupported platform",
+                pp.id,
+                pp.social_account.platform,
+                pp.social_account_id,
+                account_name,
+                pp.platform_post_id,
+            )
+            continue
+        try:
+            credentials = _resolve_publish_credentials(pp.social_account)
+            provider = get_provider(pp.social_account.platform, credentials)
+            provider.delete_post(pp.social_account.oauth_access_token, pp.platform_post_id)
+        except NotImplementedError as exc:
+            logger.info(
+                "Remote delete skipped for PlatformPost %s on %s account %s (%s), remote id %s: %s",
+                pp.id,
+                pp.social_account.platform,
+                pp.social_account_id,
+                account_name,
+                pp.platform_post_id,
+                exc,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Remote delete failed for PlatformPost %s on %s account %s (%s), remote id %s: %s",
+                pp.id,
+                pp.social_account.platform,
+                pp.social_account_id,
+                account_name,
+                pp.platform_post_id,
+                exc,
+            )
+            errors.append(f"{account_name} ({pp.social_account.get_platform_display()}): {exc}")
+    return errors
+
+
 @login_required
 @require_permission("create_posts")
 @require_POST
@@ -629,9 +792,11 @@ def save_post(request, workspace_id, post_id=None):
     """Save or update a post (draft, schedule, or publish action)."""
     workspace = _get_workspace(request, workspace_id)
     action = request.POST.get("action", "save_draft")
+    original_scheduled_at = None
 
     if post_id:
         post = get_object_or_404(Post, id=post_id, workspace=workspace)
+        original_scheduled_at = post.scheduled_at
         # Enforce edit permissions: authors can edit their own, others need edit_others_posts
         membership = request.workspace_membership
         perms = membership.effective_permissions if membership else {}
@@ -654,6 +819,8 @@ def save_post(request, workspace_id, post_id=None):
     # which is why we sync those before/after running it.
     pending_target = None  # what to transition existing children to after sync
     initial_status = "draft"  # default status for newly created PlatformPosts
+    if action in ("schedule", "publish_now", "add_to_queue", "add_to_queue_priority"):
+        _materialize_omitted_scoped_fallback_schedules(request, post, original_scheduled_at)
 
     if action == "schedule":
         sched_date = form.cleaned_data.get("scheduled_date")
@@ -708,7 +875,7 @@ def save_post(request, workspace_id, post_id=None):
         if floor_date:
             _reassign_queue_slots_from_floor(queues, post, floor_date, workspace)
         # Transition every child whose scheduled_at was filled in to "scheduled".
-        _transition_post_children(post, "scheduled", only=_scoped_platform_post_ids(request, post))
+        _transition_post_children(post, "scheduled", only=_scoped_target_platform_post_ids(request, post))
         _save_version(post, request.user)
         if request.htmx:
             return HttpResponse(
@@ -730,7 +897,7 @@ def save_post(request, workspace_id, post_id=None):
         _sync_platform_posts(request, post, workspace, initial_status="draft")
         for q in queues:
             add_to_queue(post, q, priority=True)
-        _transition_post_children(post, "scheduled", only=_scoped_platform_post_ids(request, post))
+        _transition_post_children(post, "scheduled", only=_scoped_target_platform_post_ids(request, post))
         _save_version(post, request.user)
         if request.htmx:
             return HttpResponse(
@@ -749,7 +916,9 @@ def save_post(request, workspace_id, post_id=None):
         _save_version(post, request.user)
         from apps.approvals.services import submit_for_review
 
-        submit_for_review(post, request.user, workspace)
+        approval_target = _approval_target_for_request(request, post)
+        if approval_target is not None:
+            submit_for_review(approval_target, request.user, workspace)
         if request.htmx:
             return HttpResponse(
                 status=204,
@@ -766,7 +935,9 @@ def save_post(request, workspace_id, post_id=None):
         _save_version(post, request.user)
         from apps.approvals.services import resubmit_post
 
-        resubmit_post(post, request.user, workspace)
+        approval_target = _approval_target_for_request(request, post)
+        if approval_target is not None:
+            resubmit_post(approval_target, request.user, workspace)
         if request.htmx:
             return HttpResponse(
                 status=204,
@@ -842,18 +1013,14 @@ def save_post(request, workspace_id, post_id=None):
     # PlatformPost now that they exist — except published/publishing rows
     # (their schedule is history) and, in scoped mode, siblings outside the
     # ``?account=`` scope.
-    scoped_ids = _scoped_platform_post_ids(request, post)
     propagate_dt = getattr(post, "_schedule_propagate_dt", None)
     if propagate_dt is not None:
-        propagate_qs = post.platform_posts.exclude(status__in=PlatformPost.PROTECTED_STATUSES)
-        if scoped_ids is not None:
-            propagate_qs = propagate_qs.filter(id__in=scoped_ids)
-        propagate_qs.update(scheduled_at=propagate_dt)
+        _platform_posts_for_schedule_propagation(request, post).update(scheduled_at=propagate_dt)
 
     # Move existing children to the requested target state (no-op for
     # save_draft — children that are already mid-workflow stay put).
     if pending_target:
-        _transition_post_children(post, pending_target, only=scoped_ids)
+        _transition_post_children(post, pending_target, only=_scoped_target_platform_post_ids(request, post))
 
     # Save version
     _save_version(post, request.user)
@@ -980,8 +1147,9 @@ def autosave(request, workspace_id, post_id=None):
                     continue
             del request.session[session_key]
 
-    # Sync platform selections
-    selected_ids = _parse_selected_account_ids(request.POST.get("selected_accounts", ""))
+    # Sync platform selections. Scoped composer edits only render one account,
+    # so do not treat omitted siblings as deselected.
+    selected_ids = _selected_account_ids_from_request(request)
     _remove_deselected_platform_posts(request, post, selected_ids)
     for acc_id in selected_ids:
         PlatformPost.objects.get_or_create(
@@ -996,7 +1164,8 @@ def autosave(request, workspace_id, post_id=None):
 
 
 @login_required
-@require_GET
+@never_cache
+@require_http_methods(["GET", "POST"])
 def preview(request, workspace_id):
     """Live preview endpoint - renders platform-specific preview from form state.
 
@@ -1004,10 +1173,11 @@ def preview(request, workspace_id):
     Stateless - no DB queries except social account lookup.
     """
     workspace = _get_workspace(request, workspace_id)
-    title = request.GET.get("title", "")
-    caption = request.GET.get("caption", "")
-    first_comment = request.GET.get("first_comment", "")
-    selected_ids = _parse_selected_account_ids(request.GET.get("selected_accounts", ""))
+    data = request.POST if request.method == "POST" else request.GET
+    title = data.get("title", "")
+    caption = data.get("caption", "")
+    first_comment = data.get("first_comment", "")
+    selected_ids = _parse_selected_account_ids(data.get("selected_accounts", ""))
 
     # Build preview data per platform
     previews = []
@@ -1019,8 +1189,8 @@ def preview(request, workspace_id):
         for account in accounts:
             override_title_key = f"override_title_{account.id}"
             override_key = f"override_caption_{account.id}"
-            effective_title = request.GET.get(override_title_key, "") or title
-            effective_caption = request.GET.get(override_key, "") or caption
+            effective_title = data.get(override_title_key, "") or title
+            effective_caption = data.get(override_key, "") or caption
             char_limit = account.char_limit
             field_config = account.field_config
             previews.append(
@@ -1043,7 +1213,7 @@ def preview(request, workspace_id):
     from apps.media_library.models import MediaAsset
 
     media_items = []
-    post_id_str = request.GET.get("_autosave_post_id", "")
+    post_id_str = data.get("_autosave_post_id", "")
 
     if post_id_str:
         try:
@@ -1531,13 +1701,27 @@ def post_delete(request, workspace_id, post_id):
     post = get_object_or_404(Post, id=post_id, workspace=workspace)
 
     account_id = request.GET.get("account") or request.POST.get("account")
+    delete_remote = request.POST.get("delete_remote") == "true"
     if account_id:
-        pp = get_object_or_404(PlatformPost, post=post, social_account_id=account_id)
+        pp = get_object_or_404(
+            PlatformPost.objects.select_related("social_account"),
+            post=post,
+            social_account_id=account_id,
+        )
+        if delete_remote:
+            remote_errors = _delete_remote_platform_posts([pp])
+            if remote_errors:
+                return JsonResponse({"errors": {"delete": remote_errors}}, status=502)
         pp.delete()
         # If no platform posts remain, clean up the parent post too.
         if not post.platform_posts.exists():
             post.delete()
     else:
+        if delete_remote:
+            platform_posts = list(post.platform_posts.select_related("social_account"))
+            remote_errors = _delete_remote_platform_posts(platform_posts)
+            if remote_errors:
+                return JsonResponse({"errors": {"delete": remote_errors}}, status=502)
         post.delete()
 
     return HttpResponse(
@@ -1578,7 +1762,9 @@ def _idea_columns(workspace, tag=None):
         .order_by("position", "-created_at")
     )
     if tag:
-        ideas_qs = ideas_qs.filter(tags__contains=[tag])
+        from apps.utils import json_tag_contains
+
+        ideas_qs = ideas_qs.filter(json_tag_contains("tags", tag))
 
     grouped_ideas = {str(grp.id): [] for grp in groups}
     for idea in ideas_qs:

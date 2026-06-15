@@ -288,6 +288,19 @@ class PinterestProvider(SocialProvider):
             extra=body,
         )
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        if not post_id:
+            raise PublishError(
+                "post_id is required for Pinterest pin deletion",
+                platform=self.platform_name,
+            )
+        self._request(
+            "DELETE",
+            f"{API_BASE}/pins/{post_id}",
+            access_token=access_token,
+        )
+        return True
+
     # ------------------------------------------------------------------
     # Boards
     # ------------------------------------------------------------------

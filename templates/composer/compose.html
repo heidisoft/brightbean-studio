@@ -299,6 +299,7 @@
               hx-swap="none"
               @htmx:after-request="onFormSaved($event)"
               class="flex flex-col flex-1 min-h-0">
+            {% csrf_token %}
             <input type="hidden" name="selected_accounts" :value="selectedAccounts.join(',')">
             {% if account_scope %}
             <!-- Composer opened scoped to one account (?account=) — save endpoints
@@ -1386,10 +1387,9 @@
         </div>
 
         <div id="preview-panel" class="flex-1 overflow-y-auto p-4 space-y-4 panel-scroll"
-             hx-get="{% url 'composer:preview' workspace_id=workspace.id %}"
+             hx-post="{% url 'composer:preview' workspace_id=workspace.id %}"
              hx-trigger="previewUpdate from:body"
-             hx-include="#composer-form"
-             hx-vals='js:{"title": document.querySelector("input[name=title]")?.value || "", "caption": document.querySelector("[name=caption]")?.value || "", "selected_accounts": document.querySelector("[name=selected_accounts]")?.value || "", "_autosave_post_id": document.querySelector("[name=_autosave_post_id]")?.value || ""}'>
+             hx-include="#composer-form">
             {% include "composer/partials/preview_panel.html" %}
         </div>
     </div>
@@ -1491,7 +1491,7 @@
 
     {% if is_edit %}
     <!-- Delete Confirmation Modal -->
-    <div x-data="{ showDeleteModal: false, deleting: false }" style="display: contents;"
+    <div x-data="{ showDeleteModal: false, deleting: false, deleteRemote: false }" style="display: contents;"
          @open-delete-modal.window="showDeleteModal = true">
         <div x-show="showDeleteModal" x-cloak class="fixed inset-0 z-[60] flex items-center justify-center"
              @keydown.escape.window="showDeleteModal = false">
@@ -1516,10 +1516,29 @@
                         <svg class="w-6 h-6 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                     </div>
                     <h3 class="text-base font-semibold text-stone-900 mb-1">Delete post?</h3>
-                    <p class="text-sm text-stone-500 mb-6">This action cannot be undone. The post and all associated data will be permanently removed.</p>
+                    <p class="text-sm text-stone-500 mb-4">This action cannot be undone. The post and all associated data will be permanently removed from Studio.</p>
                 </div>
+                <label class="flex items-start gap-3 rounded-xl border border-stone-200 bg-stone-50 px-3 py-3 mb-5 cursor-pointer text-left">
+                    <input type="checkbox"
+                           x-model="deleteRemote"
+                           class="mt-0.5 h-4 w-4 rounded border-stone-300 text-red-500 focus:ring-red-500">
+                    <span>
+                        <span class="block text-sm font-semibold text-stone-700">Also delete from connected platforms</span>
+                        <span class="block text-xs text-stone-500 mt-0.5">If checked, Studio will try to remove already-published posts from the remote service before deleting locally.</span>
+                        {% if remote_delete_summary.supported %}
+                        <span class="block text-xs text-stone-500 mt-2">
+                            Remote delete supported for: {{ remote_delete_summary.supported|join:", " }}.
+                        </span>
+                        {% endif %}
+                        {% if remote_delete_summary.unsupported %}
+                        <span class="block text-xs text-amber-700 mt-2">
+                            Remote delete is not supported for: {{ remote_delete_summary.unsupported|join:", " }}. Delete those posts in the platform app if needed.
+                        </span>
+                        {% endif %}
+                    </span>
+                </label>
                 <div class="flex gap-3">
-                    <button @click="showDeleteModal = false"
+                    <button @click="showDeleteModal = false; deleteRemote = false"
                             class="flex-1 px-4 py-2 text-sm font-semibold text-stone-700 bg-stone-100 rounded-full hover:bg-stone-200 transition-colors cursor-pointer">
                         Cancel
                     </button>
@@ -1529,7 +1548,11 @@
                                 const deleteUrl = '{% url 'composer:post_delete' workspace.id post.id %}' + window.location.search;
                                 fetch(deleteUrl, {
                                     method: 'POST',
-                                    headers: { 'X-CSRFToken': '{{ csrf_token }}' }
+                                    headers: {
+                                        'X-CSRFToken': '{{ csrf_token }}',
+                                        'Content-Type': 'application/x-www-form-urlencoded'
+                                    },
+                                    body: new URLSearchParams({ delete_remote: deleteRemote ? 'true' : 'false' })
                                 }).then(resp => {
                                     if (resp.ok) {
                                         window.location.href = '{% url "calendar:calendar" workspace_id=workspace.id %}';

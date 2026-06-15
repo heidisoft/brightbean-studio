@@ -337,6 +337,12 @@ class PublishEngine:
             if platform == "facebook" and "page_id" not in extra:
                 extra["page_id"] = account.account_platform_id
 
+            # Inject IG user ID for Instagram Graph API from the selected
+            # connected account. Without this, the provider falls back to the
+            # first linked Instagram account returned by Meta.
+            if platform == "instagram" and "ig_user_id" not in extra:
+                extra["ig_user_id"] = account.account_platform_id
+
             # Inject org author URN for LinkedIn Company Page.
             if platform == "linkedin_company" and "author" not in extra:
                 extra["author"] = f"urn:li:organization:{account.account_platform_id}"

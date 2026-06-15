@@ -7,6 +7,7 @@ from datetime import date, datetime, time, timedelta
 
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.db.models import QuerySet
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -54,6 +55,14 @@ def _slots_updated_response(account_id):
         status=204,
         headers={"HX-Trigger": json.dumps({"slotsUpdated": {"accountId": str(account_id)}})},
     )
+
+
+def _reassign_account_queues(social_account):
+    """Refresh queued posts after an account's posting slots change."""
+    from .services import assign_queue_slots
+
+    for queue in Queue.objects.filter(social_account=social_account, is_active=True):
+        assign_queue_slots(queue)
 
 
 def _get_workspace(request, workspace_id):
@@ -114,9 +123,11 @@ def _get_filtered_posts(workspace, request):
     if tags:
         from django.db.models import Q
 
+        from apps.utils import json_tag_contains
+
         tag_q = Q()
         for tag in tags:
-            tag_q |= Q(tags__contains=[tag])
+            tag_q |= json_tag_contains("tags", tag)
         qs = qs.filter(tag_q)
 
     # Date range
@@ -170,9 +181,11 @@ def _get_filtered_platform_posts(workspace, request):
     if tags:
         from django.db.models import Q
 
+        from apps.utils import json_tag_contains
+
         tag_q = Q()
         for tag in tags:
-            tag_q |= Q(post__tags__contains=[tag])
+            tag_q |= json_tag_contains("post__tags", tag)
         qs = qs.filter(tag_q)
 
     return qs
@@ -231,7 +244,9 @@ def _apply_publish_filters(qs, request):
 
     tag = request.GET.get("tag")
     if tag:
-        qs = qs.filter(tags__contains=[tag])
+        from apps.utils import json_tag_contains
+
+        qs = qs.filter(json_tag_contains("tags", tag))
 
     return qs
 
@@ -244,7 +259,9 @@ def _apply_pp_publish_filters(qs, request):
 
     tag = request.GET.get("tag")
     if tag:
-        qs = qs.filter(post__tags__contains=[tag])
+        from apps.utils import json_tag_contains
+
+        qs = qs.filter(json_tag_contains("post__tags", tag))
 
     return qs
 
@@ -309,7 +326,8 @@ def _get_tab_context(request, workspace, tab: str) -> dict:
             )
             .select_related("post__author", "social_account")
             .prefetch_related("post__media_attachments__media_asset")
-            .order_by("-post__scheduled_at", "-post__created_at")
+            .annotate(sent_at=Coalesce("published_at", "scheduled_at", "post__scheduled_at"))
+            .order_by("-sent_at", "-post__created_at")
         )
         platform_posts = _apply_pp_publish_filters(platform_posts, request)
         return {**base_ctx, "platform_posts": platform_posts[:200]}
@@ -846,6 +864,53 @@ def posting_slots(request, workspace_id):
 
 @login_required
 @require_POST
+@require_permission("manage_social_accounts")
+def copy_posting_slots(request, workspace_id):
+    """Replace one account's posting slots with another account's schedule."""
+    workspace = _get_workspace(request, workspace_id)
+    target_account_id = request.POST.get("target_social_account_id")
+    source_account_id = request.POST.get("source_social_account_id")
+
+    if not target_account_id or not source_account_id:
+        return JsonResponse({"error": "Choose a schedule to copy."}, status=400)
+
+    if target_account_id == source_account_id:
+        return JsonResponse({"error": "Choose a different account."}, status=400)
+
+    target_account = get_object_or_404(
+        SocialAccount,
+        id=target_account_id,
+        workspace=workspace,
+    )
+    source_account = get_object_or_404(
+        SocialAccount,
+        id=source_account_id,
+        workspace=workspace,
+    )
+
+    source_slots = list(PostingSlot.objects.filter(social_account=source_account).order_by("day_of_week", "time"))
+    copied_slots = [
+        PostingSlot(
+            social_account=target_account,
+            day_of_week=slot.day_of_week,
+            time=slot.time,
+            is_active=slot.is_active,
+        )
+        for slot in source_slots
+    ]
+
+    with transaction.atomic():
+        PostingSlot.objects.filter(social_account=target_account).delete()
+        PostingSlot.objects.bulk_create(copied_slots)
+        _reassign_account_queues(target_account)
+
+    if request.htmx:
+        return _slots_updated_response(target_account.id)
+    return JsonResponse({"copied": len(copied_slots)})
+
+
+@login_required
+@require_POST
 def save_posting_slot(request, workspace_id):
     """Create or update a posting slot."""
     workspace = _get_workspace(request, workspace_id)
@@ -873,6 +938,7 @@ def save_posting_slot(request, workspace_id):
         time=slot_time,
         defaults={"is_active": True},
     )
+    _reassign_account_queues(account)
 
     if request.htmx:
         return _slots_updated_response(account.id)
@@ -891,7 +957,9 @@ def delete_posting_slot(request, workspace_id, slot_id):
     )
 
     account_id = str(slot.social_account_id)
+    account = slot.social_account
     slot.delete()
+    _reassign_account_queues(account)
     if request.htmx:
         return _slots_updated_response(account_id)
     return JsonResponse({"deleted": True})
@@ -938,6 +1006,7 @@ def toggle_posting_slot_day(request, workspace_id):
     # If all active → deactivate; otherwise → activate all
     all_active = not slots.filter(is_active=False).exists()
     slots.update(is_active=not all_active)
+    _reassign_account_queues(account)
 
     if request.htmx:
         return _slots_updated_response(account_id)
@@ -978,6 +1047,7 @@ def update_posting_slot(request, workspace_id, slot_id):
 
     slot.time = new_time
     slot.save(update_fields=["time", "updated_at"])
+    _reassign_account_queues(slot.social_account)
 
     account_id = str(slot.social_account_id)
     if request.htmx:

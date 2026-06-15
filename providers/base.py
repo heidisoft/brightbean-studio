@@ -141,6 +141,10 @@ class SocialProvider(ABC):
         """Post a comment on an existing post (e.g. first comment)."""
         raise NotImplementedError(f"{self.platform_name} does not support comments")
 
+    def delete_post(self, access_token: str, post_id: str) -> bool:
+        """Delete an existing published post on the platform."""
+        raise NotImplementedError(f"{self.platform_name} does not support deleting published posts")
+
     # ------------------------------------------------------------------
     # Analytics (optional - override per provider)
     # ------------------------------------------------------------------
