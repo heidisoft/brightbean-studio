@@ -13,7 +13,6 @@ from apps.members.models import OrgMembership
 from .forms import SmtpCredentialForm
 from .models import PlatformCredential, SmtpCredential, SmtpTestLog
 
-
 PLATFORM_FIELDS = {
     "facebook": {
         "label": "Facebook",
