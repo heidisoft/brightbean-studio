@@ -305,6 +305,10 @@ def update_member_role(request, membership_id):
                 },
                 "is_admin": True,
                 "current_user": request.user,
+                "org_role_choices": [
+                    (OrgMembership.OrgRole.ADMIN, "Admin"),
+                    (OrgMembership.OrgRole.MEMBER, "Member"),
+                ],
                 "workspace_role_choices": WorkspaceMembership.WorkspaceRole.choices,
                 "org_role_choices": _org_role_choices_for(request.org_membership),
             },
@@ -388,6 +392,10 @@ def manage_workspaces(request, membership_id):
                     },
                     "is_admin": True,
                     "current_user": request.user,
+                    "org_role_choices": [
+                        (OrgMembership.OrgRole.ADMIN, "Admin"),
+                        (OrgMembership.OrgRole.MEMBER, "Member"),
+                    ],
                     "workspace_role_choices": WorkspaceMembership.WorkspaceRole.choices,
                     "org_role_choices": _org_role_choices_for(request.org_membership),
                 },

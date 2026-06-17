@@ -15,7 +15,7 @@
     </div>
 
     <!-- Active Members -->
-    <div style="background: var(--surface-0); border: 1px solid var(--border); border-radius: var(--radius-xl); overflow: hidden;" class="mb-8">
+    <div style="background: var(--surface-0); border: 1px solid var(--border); border-radius: var(--radius-xl); overflow: visible;" class="mb-8">
         <div class="px-6 py-4" style="border-bottom: 1px solid var(--border);">
             <h3 class="text-sm font-semibold" style="color: var(--text-primary);">Members ({{ members_data|length }})</h3>
         </div>
@@ -32,7 +32,7 @@
 
     <!-- Pending Invitations -->
     {% if is_admin %}
-    <div style="background: var(--surface-0); border: 1px solid var(--border); border-radius: var(--radius-xl); overflow: hidden;">
+    <div style="background: var(--surface-0); border: 1px solid var(--border); border-radius: var(--radius-xl); overflow: visible;">
         <div class="px-6 py-4" style="border-bottom: 1px solid var(--border);">
             <h3 class="text-sm font-semibold" style="color: var(--text-primary);">Pending Invitations</h3>
         </div>
