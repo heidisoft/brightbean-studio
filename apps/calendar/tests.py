@@ -442,7 +442,7 @@ class CalendarChannelSlotViewTests(TestCase):
         self.assertEqual(len(hour_posts), 1)
         self.assertTrue(hour_posts[0].takes_calendar_slot)
 
-    def test_day_view_excludes_published_posts_by_default_and_keeps_slot_open(self):
+    def test_day_view_shows_published_posts_by_default_and_keeps_slot_open(self):
         target = date(2026, 6, 15)  # Monday
         ny = zoneinfo.ZoneInfo("America/New_York")
         published_at = datetime(2026, 6, 15, 9, 30, tzinfo=ny)
@@ -461,7 +461,8 @@ class CalendarChannelSlotViewTests(TestCase):
 
         hour_posts = dict((hour, posts) for hour, posts, _slots in context["day_slots"])[9]
         slot_items = dict((hour, slots) for hour, _posts, slots in context["day_slots"])[9]
-        self.assertEqual(hour_posts, [])
+        self.assertEqual(len(hour_posts), 1)
+        self.assertFalse(hour_posts[0].takes_calendar_slot)
         self.assertEqual(len(slot_items), 1)
         self.assertEqual(slot_items[0]["account"], self.account)
 

@@ -154,7 +154,6 @@ def _get_filtered_platform_posts(workspace, request):
     """
     from django.db.models.functions import Coalesce
 
-    terminal_statuses = ["published", "failed"]
     qs = (
         PlatformPost.objects.filter(post__workspace_id=workspace.id)
         .select_related("post", "post__author", "post__category", "social_account")
@@ -164,7 +163,8 @@ def _get_filtered_platform_posts(workspace, request):
     # Status filter — editorial status now lives on the PlatformPost itself,
     # so each chip can stand on its own per-account state.
     statuses = request.GET.getlist("status")
-    qs = qs.filter(status__in=statuses) if statuses else qs.exclude(status__in=terminal_statuses)
+    if statuses:
+        qs = qs.filter(status__in=statuses)
 
     # Platform filter
     platforms = request.GET.getlist("platform")
