@@ -263,10 +263,11 @@ def _get_calendar_slot_occurrences(workspace, request, display_tz, visible_dates
                 )
             )
 
+    terminal_statuses = {"published", "failed"}
     taken_keys = set()
     for pp in platform_posts:
         pp.takes_calendar_slot = False
-        if not pp.effective_at:
+        if pp.status in terminal_statuses or not pp.effective_at:
             continue
         local_dt = pp.effective_at.astimezone(display_tz)
         key = (pp.social_account_id, local_dt.date(), local_dt.hour, local_dt.minute)

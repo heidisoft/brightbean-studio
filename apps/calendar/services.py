@@ -40,7 +40,7 @@ def create_default_queue_and_slots(social_account):
     return queue
 
 
-def _next_slot_datetimes(social_account, after_dt, count=30):
+def _next_slot_datetimes(social_account, after_dt, count=30, exclude_post_ids=None):
     """Compute the next `count` PostingSlot datetimes for a social account.
 
     Starting from `after_dt`, walks forward through the week to find
@@ -52,12 +52,27 @@ def _next_slot_datetimes(social_account, after_dt, count=30):
     "not before" instant. ``after_dt`` is always timezone-aware (callers pass
     ``timezone.now()`` or a tz-aware floor).
     """
+    from django.db.models.functions import Coalesce
+
+    from apps.composer.models import PlatformPost
+
     slots = PostingSlot.objects.filter(social_account=social_account, is_active=True).order_by("day_of_week", "time")
     if not slots.exists():
         return []
 
     ws_tz = zoneinfo.ZoneInfo(social_account.workspace.effective_timezone or "UTC")
     after_local = after_dt.astimezone(ws_tz)
+    exclude_post_ids = set(exclude_post_ids or [])
+    occupied_qs = (
+        PlatformPost.objects.filter(
+            social_account=social_account,
+            status__in=[PlatformPost.Status.SCHEDULED, PlatformPost.Status.PUBLISHING],
+        )
+        .exclude(post_id__in=exclude_post_ids)
+        .annotate(effective_at=Coalesce("scheduled_at", "post__scheduled_at"))
+        .exclude(effective_at__isnull=True)
+    )
+    occupied_datetimes = set(occupied_qs.values_list("effective_at", flat=True))
 
     slot_list = list(slots)
     results = []
@@ -76,6 +91,8 @@ def _next_slot_datetimes(social_account, after_dt, count=30):
             # offsets resolve per-date), then compare as instants (both aware).
             slot_dt = datetime.combine(check_date, slot.time).replace(tzinfo=ws_tz)
             if slot_dt <= after_dt:
+                continue
+            if slot_dt in occupied_datetimes:
                 continue
 
             results.append(slot_dt)
@@ -99,7 +116,22 @@ def assign_queue_slots(queue):
     keeps ``QueueEntry.assigned_slot_datetime`` in sync.  ``Post.scheduled_at``
     is then refreshed via ``sync_post_scheduled_at`` as min-of-children.
     """
+    from apps.composer.models import PlatformPost
     from apps.composer.services import sync_post_scheduled_at
+
+    stale_entry_ids = []
+    entries = []
+    for entry in queue.entries.select_related("post").order_by("position"):
+        pp = entry.post.platform_posts.filter(social_account=queue.social_account).first()
+        if pp is None or pp.status in (PlatformPost.Status.PUBLISHED, PlatformPost.Status.FAILED):
+            stale_entry_ids.append(entry.id)
+            continue
+        entry._queue_platform_post = pp
+        entries.append(entry)
+
+    if stale_entry_ids:
+        QueueEntry.objects.filter(id__in=stale_entry_ids).delete()
+        _compact_queue_positions(queue)
 
     entries = list(queue.entries.select_related("post").order_by("position"))
     if not entries:
@@ -107,7 +139,12 @@ def assign_queue_slots(queue):
 
     now = timezone.now()
     max_pos = max(e.position for e in entries)
-    slot_times = _next_slot_datetimes(queue.social_account, now, count=max_pos + 10)
+    slot_times = _next_slot_datetimes(
+        queue.social_account,
+        now,
+        count=max_pos + 10,
+        exclude_post_ids=[entry.post_id for entry in entries],
+    )
 
     touched_posts = []
     for entry in entries:
@@ -117,7 +154,9 @@ def assign_queue_slots(queue):
             entry.save(update_fields=["assigned_slot_datetime"])
 
         # Write the per-platform scheduled_at on the matching PlatformPost.
-        pp = entry.post.platform_posts.filter(social_account=queue.social_account).first()
+        pp = getattr(entry, "_queue_platform_post", None)
+        if pp is None:
+            pp = entry.post.platform_posts.filter(social_account=queue.social_account).first()
         if pp is not None:
             pp.scheduled_at = slot_dt
             pp.save(update_fields=["scheduled_at", "updated_at"])
@@ -177,6 +216,27 @@ def remove_from_queue(post, social_account_ids):
         queue__is_active=True,
         post=post,
     ).delete()
+
+
+def _compact_queue_positions(queue):
+    """Normalise queue positions to contiguous zero-based ordering."""
+    for idx, entry in enumerate(queue.entries.order_by("position", "created_at")):
+        if entry.position != idx:
+            entry.position = idx
+            entry.save(update_fields=["position"])
+
+
+def complete_queue_entry(post, social_account):
+    """Remove a successfully published post from its channel queue.
+
+    Publishing is different from manual rescheduling: once a queue entry has
+    completed, the rest of the queue should slide forward into the freed slots.
+    """
+    queues = list(Queue.objects.filter(social_account=social_account, is_active=True, entries__post=post).distinct())
+    for queue in queues:
+        QueueEntry.objects.filter(queue=queue, post=post).delete()
+        _compact_queue_positions(queue)
+        assign_queue_slots(queue)
 
 
 def reorder_queue(queue, ordered_entry_ids):

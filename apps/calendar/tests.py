@@ -10,7 +10,7 @@ from django.utils import timezone
 
 from apps.accounts.models import User
 from apps.calendar.models import PostingSlot, Queue, QueueEntry, RecurrenceRule
-from apps.calendar.services import add_to_queue
+from apps.calendar.services import add_to_queue, assign_queue_slots, complete_queue_entry
 from apps.calendar.tasks import generate_recurring_posts
 from apps.calendar.views import _day_view_data
 from apps.composer.models import PlatformPost, Post
@@ -293,6 +293,97 @@ class QueueSlotTimezoneTests(TestCase):
         pp = PlatformPost.objects.get(post=post, social_account=self.account)
         self.assertEqual(pp.scheduled_at, entry.assigned_slot_datetime)
 
+    def test_published_queue_entry_is_completed_and_next_post_moves_forward(self):
+        fixed_now = datetime(2026, 6, 15, 8, 0, tzinfo=zoneinfo.ZoneInfo("America/New_York"))
+        first_post = Post.objects.create(workspace=self.workspace, caption="first")
+        second_post = Post.objects.create(workspace=self.workspace, caption="second")
+        first_pp = PlatformPost.objects.create(
+            post=first_post,
+            social_account=self.account,
+            status=PlatformPost.Status.SCHEDULED,
+        )
+        second_pp = PlatformPost.objects.create(
+            post=second_post,
+            social_account=self.account,
+            status=PlatformPost.Status.SCHEDULED,
+        )
+
+        with patch("apps.calendar.services.timezone.now", return_value=fixed_now):
+            add_to_queue(first_post, self.queue)
+            add_to_queue(second_post, self.queue)
+
+        first_entry = QueueEntry.objects.get(queue=self.queue, post=first_post)
+        second_entry = QueueEntry.objects.get(queue=self.queue, post=second_post)
+        self.assertEqual(first_entry.position, 0)
+        self.assertEqual(second_entry.position, 1)
+        first_slot = first_entry.assigned_slot_datetime
+        self.assertNotEqual(second_entry.assigned_slot_datetime, first_slot)
+
+        first_pp.status = PlatformPost.Status.PUBLISHED
+        first_pp.published_at = timezone.now()
+        first_pp.save(update_fields=["status", "published_at"])
+        with patch("apps.calendar.services.timezone.now", return_value=fixed_now):
+            complete_queue_entry(first_post, self.account)
+
+        self.assertFalse(QueueEntry.objects.filter(queue=self.queue, post=first_post).exists())
+        second_entry.refresh_from_db()
+        second_pp.refresh_from_db()
+        self.assertEqual(second_entry.position, 0)
+        self.assertEqual(second_entry.assigned_slot_datetime, first_slot)
+        self.assertEqual(second_pp.scheduled_at, first_slot)
+
+    def test_assign_queue_slots_prunes_stale_published_entries(self):
+        fixed_now = datetime(2026, 6, 15, 8, 0, tzinfo=zoneinfo.ZoneInfo("America/New_York"))
+        first_post = Post.objects.create(workspace=self.workspace, caption="already published")
+        second_post = Post.objects.create(workspace=self.workspace, caption="second")
+        PlatformPost.objects.create(
+            post=first_post,
+            social_account=self.account,
+            status=PlatformPost.Status.PUBLISHED,
+            published_at=timezone.now(),
+        )
+        second_pp = PlatformPost.objects.create(
+            post=second_post,
+            social_account=self.account,
+            status=PlatformPost.Status.SCHEDULED,
+        )
+        first_entry = QueueEntry.objects.create(queue=self.queue, post=first_post, position=0)
+        second_entry = QueueEntry.objects.create(queue=self.queue, post=second_post, position=1)
+
+        with patch("apps.calendar.services.timezone.now", return_value=fixed_now):
+            assign_queue_slots(self.queue)
+
+        self.assertFalse(QueueEntry.objects.filter(id=first_entry.id).exists())
+        second_entry.refresh_from_db()
+        second_pp.refresh_from_db()
+        self.assertEqual(second_entry.position, 0)
+        self.assertEqual(second_entry.assigned_slot_datetime, second_pp.scheduled_at)
+
+    def test_queue_assignment_skips_occupied_channel_slot(self):
+        fixed_now = datetime(2026, 6, 15, 8, 0, tzinfo=zoneinfo.ZoneInfo("America/New_York"))
+        PostingSlot.objects.create(social_account=self.account, day_of_week=0, time=time(10, 0))
+        occupied_at = datetime(2026, 6, 15, 9, 0, tzinfo=zoneinfo.ZoneInfo("America/New_York"))
+        occupied_post = Post.objects.create(workspace=self.workspace, caption="manual", scheduled_at=occupied_at)
+        PlatformPost.objects.create(
+            post=occupied_post,
+            social_account=self.account,
+            status=PlatformPost.Status.SCHEDULED,
+            scheduled_at=occupied_at,
+        )
+        queued_post = Post.objects.create(workspace=self.workspace, caption="queued")
+        queued_pp = PlatformPost.objects.create(
+            post=queued_post,
+            social_account=self.account,
+            status=PlatformPost.Status.SCHEDULED,
+        )
+
+        with patch("apps.calendar.services.timezone.now", return_value=fixed_now):
+            add_to_queue(queued_post, self.queue)
+
+        queued_pp.refresh_from_db()
+        local = queued_pp.scheduled_at.astimezone(zoneinfo.ZoneInfo("America/New_York"))
+        self.assertEqual((local.hour, local.minute), (10, 0))
+
     def test_workspace_override_takes_precedence_over_org(self):
         # An explicit workspace timezone overrides the org default.
         self.workspace.timezone = "Asia/Tokyo"
@@ -350,6 +441,53 @@ class CalendarChannelSlotViewTests(TestCase):
         self.assertEqual(slot_items, [])
         self.assertEqual(len(hour_posts), 1)
         self.assertTrue(hour_posts[0].takes_calendar_slot)
+
+    def test_day_view_shows_published_posts_by_default_and_keeps_slot_open(self):
+        target = date(2026, 6, 15)  # Monday
+        ny = zoneinfo.ZoneInfo("America/New_York")
+        published_at = datetime(2026, 6, 15, 9, 30, tzinfo=ny)
+        PostingSlot.objects.create(social_account=self.account, day_of_week=0, time=time(9, 30))
+        post = Post.objects.create(workspace=self.workspace, caption="published", scheduled_at=published_at)
+        PlatformPost.objects.create(
+            post=post,
+            social_account=self.account,
+            status="published",
+            scheduled_at=published_at,
+            published_at=published_at,
+        )
+
+        context = {"display_timezone": "America/New_York"}
+        _day_view_data(self.factory.get("/"), self.workspace, target, context)
+
+        hour_posts = dict((hour, posts) for hour, posts, _slots in context["day_slots"])[9]
+        slot_items = dict((hour, slots) for hour, _posts, slots in context["day_slots"])[9]
+        self.assertEqual(len(hour_posts), 1)
+        self.assertFalse(hour_posts[0].takes_calendar_slot)
+        self.assertEqual(len(slot_items), 1)
+        self.assertEqual(slot_items[0]["account"], self.account)
+
+    def test_day_view_can_filter_to_published_without_marking_slot_taken(self):
+        target = date(2026, 6, 15)  # Monday
+        ny = zoneinfo.ZoneInfo("America/New_York")
+        published_at = datetime(2026, 6, 15, 9, 30, tzinfo=ny)
+        PostingSlot.objects.create(social_account=self.account, day_of_week=0, time=time(9, 30))
+        post = Post.objects.create(workspace=self.workspace, caption="published", scheduled_at=published_at)
+        PlatformPost.objects.create(
+            post=post,
+            social_account=self.account,
+            status="published",
+            scheduled_at=published_at,
+            published_at=published_at,
+        )
+
+        context = {"display_timezone": "America/New_York"}
+        _day_view_data(self.factory.get("/", {"status": "published"}), self.workspace, target, context)
+
+        hour_posts = dict((hour, posts) for hour, posts, _slots in context["day_slots"])[9]
+        slot_items = dict((hour, slots) for hour, _posts, slots in context["day_slots"])[9]
+        self.assertEqual(len(hour_posts), 1)
+        self.assertFalse(hour_posts[0].takes_calendar_slot)
+        self.assertEqual(len(slot_items), 1)
 
     def test_day_view_channel_filter_limits_slot_badges(self):
         target = date(2026, 6, 15)  # Monday

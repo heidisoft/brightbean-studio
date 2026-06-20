@@ -215,6 +215,12 @@ class PublishEngine:
                 platform_post.status = PlatformPost.Status.PUBLISHED
                 platform_post.published_at = timezone.now()
                 platform_post.save()
+                try:
+                    from apps.calendar.services import complete_queue_entry
+
+                    complete_queue_entry(platform_post.post, platform_post.social_account)
+                except Exception:
+                    logger.exception("Queue cleanup failed after publishing PlatformPost %s", platform_post.id)
 
                 # Log success
                 PublishLog.objects.create(
