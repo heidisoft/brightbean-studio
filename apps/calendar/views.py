@@ -154,6 +154,7 @@ def _get_filtered_platform_posts(workspace, request):
     """
     from django.db.models.functions import Coalesce
 
+    terminal_statuses = ["published", "failed"]
     qs = (
         PlatformPost.objects.filter(post__workspace_id=workspace.id)
         .select_related("post", "post__author", "post__category", "social_account")
@@ -163,8 +164,7 @@ def _get_filtered_platform_posts(workspace, request):
     # Status filter — editorial status now lives on the PlatformPost itself,
     # so each chip can stand on its own per-account state.
     statuses = request.GET.getlist("status")
-    if statuses:
-        qs = qs.filter(status__in=statuses)
+    qs = qs.filter(status__in=statuses) if statuses else qs.exclude(status__in=terminal_statuses)
 
     # Platform filter
     platforms = request.GET.getlist("platform")
@@ -263,10 +263,11 @@ def _get_calendar_slot_occurrences(workspace, request, display_tz, visible_dates
                 )
             )
 
+    terminal_statuses = {"published", "failed"}
     taken_keys = set()
     for pp in platform_posts:
         pp.takes_calendar_slot = False
-        if not pp.effective_at:
+        if pp.status in terminal_statuses or not pp.effective_at:
             continue
         local_dt = pp.effective_at.astimezone(display_tz)
         key = (pp.social_account_id, local_dt.date(), local_dt.hour, local_dt.minute)
