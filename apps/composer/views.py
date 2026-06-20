@@ -310,7 +310,7 @@ def _reassign_queue_slots_from_floor(queues, post, floor_date, workspace):
     floor_dt = max(floor_dt, timezone.now())
 
     for q in queues:
-        slots = _next_slot_datetimes(q.social_account, floor_dt, count=1)
+        slots = _next_slot_datetimes(q.social_account, floor_dt, count=1, exclude_post_ids=[post.id])
         if not slots:
             continue
         pp = post.platform_posts.filter(social_account=q.social_account).first()
