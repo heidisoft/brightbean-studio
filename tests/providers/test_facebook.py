@@ -225,19 +225,17 @@ def test_publish_multi_photo_cleans_up_after_partial_staging_failure():
 # ---------------------------------------------------------------------------
 
 
-def test_post_metrics_use_v21_valid_metrics():
-    """v20+: deprecated post_engaged_users/post_reactions_by_type_total replaced with v21 equivalents."""
+def test_post_metrics_read_from_post_object_fields():
+    """v21: /insights sub-edge deprecated; engagement read from post object fields instead."""
     provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
     provider._request = MagicMock(
         return_value=MagicMock(
             json=MagicMock(
                 return_value={
-                    "data": [
-                        {"name": "post_impressions", "values": [{"value": 500}]},
-                        {"name": "post_impressions_unique", "values": [{"value": 300}]},
-                        {"name": "post_clicks", "values": [{"value": 40}]},
-                        {"name": "post_reactions_like_total", "values": [{"value": 25}]},
-                    ]
+                    "id": "post-1",
+                    "reactions": {"summary": {"total_count": 25}},
+                    "comments": {"summary": {"total_count": 8}},
+                    "shares": {"count": 3},
                 }
             )
         )
@@ -245,20 +243,19 @@ def test_post_metrics_use_v21_valid_metrics():
 
     metrics = provider.get_post_metrics("page-token", "post-1")
 
-    assert metrics.impressions == 500
-    assert metrics.reach == 300
-    assert metrics.clicks == 40
     assert metrics.likes == 25
+    assert metrics.comments == 8
+    assert metrics.shares == 3
     provider._request.assert_called_once_with(
         "GET",
-        "https://graph.facebook.com/v21.0/post-1/insights",
+        "https://graph.facebook.com/v21.0/post-1",
         access_token="page-token",
-        params={"metric": "post_impressions,post_impressions_unique,post_clicks,post_reactions_like_total"},
+        params={"fields": "id,reactions.summary(total_count),comments.summary(true),shares"},
     )
 
 
-def test_account_metrics_use_v21_valid_metrics_with_period():
-    """v20+: page_engaged_users/page_fans deprecated; period=day now required for all day metrics."""
+def test_account_metrics_use_only_page_impressions():
+    """v21: page_impressions_unique and page_fan_adds also deprecated; only page_impressions survives."""
     provider = FacebookProvider({"client_id": "id", "client_secret": "secret", "page_id": "page-1"})
     provider._request = MagicMock(
         return_value=MagicMock(
@@ -266,8 +263,6 @@ def test_account_metrics_use_v21_valid_metrics_with_period():
                 return_value={
                     "data": [
                         {"name": "page_impressions", "values": [{"value": 1000}]},
-                        {"name": "page_impressions_unique", "values": [{"value": 600}]},
-                        {"name": "page_fan_adds", "values": [{"value": 12}]},
                     ]
                 }
             )
@@ -283,14 +278,12 @@ def test_account_metrics_use_v21_valid_metrics_with_period():
     )
 
     assert metrics.impressions == 1000
-    assert metrics.reach == 600
-    assert metrics.followers_gained == 12
     provider._request.assert_called_once_with(
         "GET",
         "https://graph.facebook.com/v21.0/page-1/insights",
         access_token="page-token",
         params={
-            "metric": "page_impressions,page_impressions_unique,page_fan_adds",
+            "metric": "page_impressions",
             "period": "day",
             "since": 1781740800,
             "until": 1781827200,

@@ -415,44 +415,33 @@ class FacebookProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def get_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
-        # v20+: post_engaged_users and post_reactions_by_type_total deprecated.
-        metrics = [
-            "post_impressions",
-            "post_impressions_unique",
-            "post_clicks",
-            "post_reactions_like_total",
-        ]
+        # v21: /insights sub-edge has very few valid metrics left. Read engagement
+        # counts directly from the post object — these fields are stable across versions.
         resp = self._request(
             "GET",
-            f"{BASE_URL}/{post_id}/insights",
+            f"{BASE_URL}/{post_id}",
             access_token=access_token,
-            params={"metric": ",".join(metrics)},
+            params={
+                "fields": "id,reactions.summary(total_count),comments.summary(true),shares"
+            },
         )
         data = resp.json()
-        values: dict = {}
-        for entry in data.get("data", []):
-            name = entry.get("name", "")
-            val = entry.get("values", [{}])[0].get("value", 0)
-            values[name] = val
-
         return PostMetrics(
-            impressions=values.get("post_impressions", 0),
-            reach=values.get("post_impressions_unique", 0),
-            clicks=values.get("post_clicks", 0),
-            likes=values.get("post_reactions_like_total", 0),
-            extra={"raw_insights": values},
+            likes=data.get("reactions", {}).get("summary", {}).get("total_count", 0),
+            comments=data.get("comments", {}).get("summary", {}).get("total_count", 0),
+            shares=data.get("shares", {}).get("count", 0),
+            extra={"raw_data": data},
         )
 
     def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
         page_id = self.credentials.get("page_id", "me")
-        # v20+: page_engaged_users, page_fans deprecated; period=day required for all day metrics.
-        metrics = ["page_impressions", "page_impressions_unique", "page_fan_adds"]
+        # v21: only page_impressions reliably survives; unique/fan_adds also deprecated.
         resp = self._request(
             "GET",
             f"{BASE_URL}/{page_id}/insights",
             access_token=access_token,
             params={
-                "metric": ",".join(metrics),
+                "metric": "page_impressions",
                 "period": "day",
                 "since": int(date_range[0].timestamp()),
                 "until": int(date_range[1].timestamp()),
@@ -467,8 +456,6 @@ class FacebookProvider(SocialProvider):
 
         return AccountMetrics(
             impressions=values.get("page_impressions", 0),
-            reach=values.get("page_impressions_unique", 0),
-            followers_gained=values.get("page_fan_adds", 0),
             extra={"raw_insights": values},
         )
 

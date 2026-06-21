@@ -45,9 +45,9 @@ PLATFORM_METRICS: dict[str, list[str]] = {
     # delta the "follows" key implies — "New followers" would always show +0.
     "instagram": ["reach", "views", "likes", "comments", "saves", "shares", "engagement"],
     "instagram_login": ["reach", "views", "likes", "comments", "saves", "shares", "engagement"],
-    # FB post insights: impressions, reach (unique), reactions, clicks.
-    # comments/shares not available via Page post /insights in v21 — omitted to avoid permanent zeros.
-    "facebook": ["impressions", "reach", "reactions", "clicks", "follows", "engagement"],
+    # FB v21: /post/insights largely deprecated; post data from object fields (reactions/comments/shares).
+    # Account: only page_impressions survives in /page/insights; reach/fan_adds also removed in v21.
+    "facebook": ["impressions", "reactions", "comments", "shares", "engagement"],
     # LinkedIn share statistics: impressions, reactions, comments, reposts, clicks, engagement.
     "linkedin_company": ["impressions", "reactions", "comments", "reposts", "clicks", "follows", "engagement"],
     # LinkedIn Personal: only socialActions counts (no impressions/reach per API).
