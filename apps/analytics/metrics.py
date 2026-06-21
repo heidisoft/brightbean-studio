@@ -41,10 +41,13 @@ ACCOUNT_ONLY: set[str] = {"follows", "followers", "subscribers"}
 PLATFORM_METRICS: dict[str, list[str]] = {
     # IG media insights: reach, views (replaced impressions Apr-2025), likes,
     # comments, saved, shares, total_interactions; follower growth at account level.
-    "instagram": ["reach", "views", "likes", "comments", "saves", "shares", "follows", "engagement"],
-    "instagram_login": ["reach", "views", "likes", "comments", "saves", "shares", "follows", "engagement"],
-    # FB post insights: impressions, reach (unique), reactions, comments, shares, clicks.
-    "facebook": ["impressions", "reach", "reactions", "comments", "shares", "clicks", "follows", "engagement"],
+    # "follows" removed: follower_count from Insights is a daily snapshot (total), not the
+    # delta the "follows" key implies — "New followers" would always show +0.
+    "instagram": ["reach", "views", "likes", "comments", "saves", "shares", "engagement"],
+    "instagram_login": ["reach", "views", "likes", "comments", "saves", "shares", "engagement"],
+    # FB post insights: impressions, reach (unique), reactions, clicks.
+    # comments/shares not available via Page post /insights in v21 — omitted to avoid permanent zeros.
+    "facebook": ["impressions", "reach", "reactions", "clicks", "follows", "engagement"],
     # LinkedIn share statistics: impressions, reactions, comments, reposts, clicks, engagement.
     "linkedin_company": ["impressions", "reactions", "comments", "reposts", "clicks", "follows", "engagement"],
     # LinkedIn Personal: only socialActions counts (no impressions/reach per API).

@@ -95,7 +95,44 @@ def test_get_user_pages_omits_blank_page_access_token():
     assert "access_token" not in accounts[0]
 
 
-def test_account_metrics_use_current_instagram_insights_metrics():
+def test_post_metrics_request_views_not_engagement():
+    """Apr 2025: impressions→views, engagement removed; individual counts returned directly."""
+    provider = InstagramProvider({"client_id": "id", "client_secret": "secret", "ig_user_id": "ig-1"})
+    provider._request = MagicMock(
+        return_value=MagicMock(
+            json=MagicMock(
+                return_value={
+                    "data": [
+                        {"name": "views", "values": [{"value": 100}]},
+                        {"name": "reach", "values": [{"value": 80}]},
+                        {"name": "saved", "values": [{"value": 5}]},
+                        {"name": "likes", "values": [{"value": 20}]},
+                        {"name": "comments", "values": [{"value": 3}]},
+                        {"name": "shares", "values": [{"value": 2}]},
+                    ]
+                }
+            )
+        )
+    )
+
+    metrics = provider.get_post_metrics("page-token", "post-1")
+
+    assert metrics.video_views == 100
+    assert metrics.reach == 80
+    assert metrics.saves == 5
+    assert metrics.likes == 20
+    assert metrics.comments == 3
+    assert metrics.shares == 2
+    provider._request.assert_called_once_with(
+        "GET",
+        "https://graph.facebook.com/v21.0/post-1/insights",
+        access_token="page-token",
+        params={"metric": "views,reach,saved,likes,comments,shares"},
+    )
+
+
+def test_account_metrics_profile_views_fetched_with_total_value():
+    """profile_views must use metric_type=total_value — cannot be in the day-period request."""
     provider = InstagramProvider({"client_id": "id", "client_secret": "secret", "ig_user_id": "ig-1"})
     provider._request = MagicMock(
         side_effect=[
@@ -105,7 +142,6 @@ def test_account_metrics_use_current_instagram_insights_metrics():
                         "data": [
                             {"name": "reach", "values": [{"value": 12}]},
                             {"name": "follower_count", "values": [{"value": 34}]},
-                            {"name": "profile_views", "values": [{"value": 5}]},
                         ]
                     }
                 )
@@ -114,11 +150,8 @@ def test_account_metrics_use_current_instagram_insights_metrics():
                 json=MagicMock(
                     return_value={
                         "data": [
-                            {
-                                "name": "views",
-                                "period": "day",
-                                "total_value": {"value": 67},
-                            }
+                            {"name": "views", "period": "day", "total_value": {"value": 67}},
+                            {"name": "profile_views", "period": "day", "total_value": {"value": 5}},
                         ]
                     }
                 )
@@ -134,7 +167,6 @@ def test_account_metrics_use_current_instagram_insights_metrics():
         ),
     )
 
-    assert metrics.impressions == 0
     assert metrics.reach == 12
     assert metrics.followers == 34
     assert metrics.profile_views == 5
@@ -146,7 +178,7 @@ def test_account_metrics_use_current_instagram_insights_metrics():
                 "https://graph.facebook.com/v21.0/ig-1/insights",
                 access_token="page-token",
                 params={
-                    "metric": "reach,follower_count,profile_views",
+                    "metric": "reach,follower_count",
                     "period": "day",
                     "since": 1781740800,
                     "until": 1781827200,
@@ -157,7 +189,7 @@ def test_account_metrics_use_current_instagram_insights_metrics():
                 "https://graph.facebook.com/v21.0/ig-1/insights",
                 access_token="page-token",
                 params={
-                    "metric": "views",
+                    "metric": "views,profile_views",
                     "period": "day",
                     "metric_type": "total_value",
                     "since": 1781740800,
@@ -168,7 +200,44 @@ def test_account_metrics_use_current_instagram_insights_metrics():
     )
 
 
-def test_instagram_login_account_metrics_use_current_insights_metrics():
+def test_instagram_login_post_metrics_request_views_not_engagement():
+    """Apr 2025: impressions→views, engagement removed; individual counts returned directly."""
+    provider = InstagramLoginProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(
+        return_value=MagicMock(
+            json=MagicMock(
+                return_value={
+                    "data": [
+                        {"name": "views", "values": [{"value": 200}]},
+                        {"name": "reach", "values": [{"value": 150}]},
+                        {"name": "saved", "values": [{"value": 8}]},
+                        {"name": "likes", "values": [{"value": 30}]},
+                        {"name": "comments", "values": [{"value": 4}]},
+                        {"name": "shares", "values": [{"value": 1}]},
+                    ]
+                }
+            )
+        )
+    )
+
+    metrics = provider.get_post_metrics("ig-token", "post-2")
+
+    assert metrics.video_views == 200
+    assert metrics.reach == 150
+    assert metrics.saves == 8
+    assert metrics.likes == 30
+    assert metrics.comments == 4
+    assert metrics.shares == 1
+    provider._request.assert_called_once_with(
+        "GET",
+        "https://graph.instagram.com/v21.0/post-2/insights",
+        access_token="ig-token",
+        params={"metric": "views,reach,saved,likes,comments,shares"},
+    )
+
+
+def test_instagram_login_account_metrics_profile_views_fetched_with_total_value():
+    """profile_views must use metric_type=total_value — cannot be in the day-period request."""
     provider = InstagramLoginProvider({"client_id": "id", "client_secret": "secret"})
     provider._request = MagicMock(
         side_effect=[
@@ -178,7 +247,6 @@ def test_instagram_login_account_metrics_use_current_insights_metrics():
                         "data": [
                             {"name": "reach", "values": [{"value": 12}]},
                             {"name": "follower_count", "values": [{"value": 34}]},
-                            {"name": "profile_views", "values": [{"value": 5}]},
                         ]
                     }
                 )
@@ -187,11 +255,8 @@ def test_instagram_login_account_metrics_use_current_insights_metrics():
                 json=MagicMock(
                     return_value={
                         "data": [
-                            {
-                                "name": "views",
-                                "period": "day",
-                                "total_value": {"value": 67},
-                            }
+                            {"name": "views", "period": "day", "total_value": {"value": 67}},
+                            {"name": "profile_views", "period": "day", "total_value": {"value": 5}},
                         ]
                     }
                 )
@@ -207,7 +272,6 @@ def test_instagram_login_account_metrics_use_current_insights_metrics():
         ),
     )
 
-    assert metrics.impressions == 0
     assert metrics.reach == 12
     assert metrics.followers == 34
     assert metrics.profile_views == 5
@@ -219,7 +283,7 @@ def test_instagram_login_account_metrics_use_current_insights_metrics():
                 "https://graph.instagram.com/v21.0/me/insights",
                 access_token="ig-token",
                 params={
-                    "metric": "reach,follower_count,profile_views",
+                    "metric": "reach,follower_count",
                     "period": "day",
                     "since": 1781740800,
                     "until": 1781827200,
@@ -230,7 +294,7 @@ def test_instagram_login_account_metrics_use_current_insights_metrics():
                 "https://graph.instagram.com/v21.0/me/insights",
                 access_token="ig-token",
                 params={
-                    "metric": "views",
+                    "metric": "views,profile_views",
                     "period": "day",
                     "metric_type": "total_value",
                     "since": 1781740800,

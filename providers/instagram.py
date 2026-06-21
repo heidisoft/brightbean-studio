@@ -393,7 +393,8 @@ class InstagramProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def get_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
-        metrics = ["impressions", "reach", "engagement", "saved"]
+        # Apr 2025: impressions→views, engagement removed; individual counts returned directly.
+        metrics = ["views", "reach", "saved", "likes", "comments", "shares"]
         resp = self._request(
             "GET",
             f"{BASE_URL}/{post_id}/insights",
@@ -408,10 +409,12 @@ class InstagramProvider(SocialProvider):
             values[name] = val
 
         return PostMetrics(
-            impressions=values.get("impressions", 0),
+            video_views=values.get("views", 0),
             reach=values.get("reach", 0),
-            engagements=values.get("engagement", 0),
             saves=values.get("saved", 0),
+            likes=values.get("likes", 0),
+            comments=values.get("comments", 0),
+            shares=values.get("shares", 0),
             extra={"raw_insights": values},
         )
 
@@ -419,7 +422,8 @@ class InstagramProvider(SocialProvider):
         ig_user_id = self.credentials.get("ig_user_id", "me")
         since = int(date_range[0].timestamp())
         until = int(date_range[1].timestamp())
-        metrics = ["reach", "follower_count", "profile_views"]
+        # profile_views requires metric_type=total_value — cannot be batched with day-period metrics.
+        metrics = ["reach", "follower_count"]
         resp = self._request(
             "GET",
             f"{BASE_URL}/{ig_user_id}/insights",
@@ -438,23 +442,23 @@ class InstagramProvider(SocialProvider):
             val = entry.get("values", [{}])[0].get("value", 0)
             values[name] = val
 
-        views_resp = self._request(
+        total_value_resp = self._request(
             "GET",
             f"{BASE_URL}/{ig_user_id}/insights",
             access_token=access_token,
             params={
-                "metric": "views",
+                "metric": "views,profile_views",
                 "period": "day",
                 "metric_type": "total_value",
                 "since": since,
                 "until": until,
             },
         )
-        views_data = views_resp.json()
-        for entry in views_data.get("data", []):
-            if entry.get("name") == "views":
-                values["views"] = entry.get("total_value", {}).get("value", 0)
-                break
+        total_value_data = total_value_resp.json()
+        for entry in total_value_data.get("data", []):
+            name = entry.get("name")
+            if name in ("views", "profile_views"):
+                values[name] = entry.get("total_value", {}).get("value", 0)
 
         return AccountMetrics(
             reach=values.get("reach", 0),
