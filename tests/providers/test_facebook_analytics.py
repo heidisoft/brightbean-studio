@@ -17,6 +17,7 @@ def test_account_metrics_use_current_page_insights_metrics():
                         {"name": "page_post_engagements", "values": [{"value": 34}]},
                         {"name": "page_daily_follows", "values": [{"value": 5}]},
                         {"name": "page_views_total", "values": [{"value": 8}]},
+                        {"name": "page_video_views", "values": [{"value": 13}]},
                     ]
                 }
             )
@@ -34,13 +35,14 @@ def test_account_metrics_use_current_page_insights_metrics():
     assert metrics.reach == 0
     assert metrics.profile_views == 8
     assert metrics.followers_gained == 5
+    assert metrics.extra["views"] == 13
     assert metrics.extra["raw_insights"]["page_post_engagements"] == 34
     provider._request.assert_called_once_with(
         "GET",
         "https://graph.facebook.com/v21.0/page-1/insights",
         access_token="page-token",
         params={
-            "metric": "page_post_engagements,page_daily_follows,page_views_total",
+            "metric": "page_post_engagements,page_daily_follows,page_views_total,page_video_views",
             "since": 1781740800,
             "until": 1781827200,
         },
@@ -131,14 +133,28 @@ def test_facebook_post_metrics_persist_reactions_key():
     assert out["clicks"] == 4.0
 
 
+def test_facebook_account_metrics_persist_page_views_and_video_views():
+    from apps.analytics.tasks import _account_metrics_to_dict
+    from providers.types import AccountMetrics
+
+    metrics = AccountMetrics(profile_views=8, followers_gained=5, extra={"views": 13})
+
+    out = _account_metrics_to_dict(metrics, "facebook")
+
+    assert out["profile_visits"] == 8.0
+    assert out["views"] == 13.0
+    assert out["follows"] == 5.0
+
+
 def test_facebook_catalog_uses_supported_metrics():
     from apps.analytics.metrics import PLATFORM_METRICS, PLATFORM_PRIMARY
 
     assert PLATFORM_PRIMARY["facebook"] == "profile_visits"
-    assert "views" not in PLATFORM_METRICS["facebook"]
     assert "reach" not in PLATFORM_METRICS["facebook"]
     assert "impressions" not in PLATFORM_METRICS["facebook"]
-    assert {"profile_visits", "reactions", "comments", "shares", "clicks", "follows"} <= set(PLATFORM_METRICS["facebook"])
+    assert {"profile_visits", "views", "reactions", "comments", "shares", "clicks", "follows"} <= set(
+        PLATFORM_METRICS["facebook"]
+    )
 
 
 def test_post_metrics_falls_back_for_objects_without_insights_edge():

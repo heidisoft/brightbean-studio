@@ -441,7 +441,7 @@ class FacebookProvider(SocialProvider):
 
     def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
         page_id = self.credentials.get("page_id", "me")
-        metrics = ["page_post_engagements", "page_daily_follows", "page_views_total"]
+        metrics = ["page_post_engagements", "page_daily_follows", "page_views_total", "page_video_views"]
         resp = self._request(
             "GET",
             f"{BASE_URL}/{page_id}/insights",
@@ -462,7 +462,7 @@ class FacebookProvider(SocialProvider):
         return AccountMetrics(
             profile_views=values.get("page_views_total", 0),
             followers_gained=values.get("page_daily_follows", 0),
-            extra={"raw_insights": values},
+            extra={"views": values.get("page_video_views", 0), "raw_insights": values},
         )
 
     # ------------------------------------------------------------------
