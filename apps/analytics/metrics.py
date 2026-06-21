@@ -39,15 +39,12 @@ ACCOUNT_ONLY: set[str] = {"follows", "followers", "subscribers"}
 # Which metrics each platform's API reports (after the scope upgrades in the
 # plan are in place). Verified against each platform's published insights API.
 PLATFORM_METRICS: dict[str, list[str]] = {
-    # IG media insights (Graph API v21, post-Apr 2025): views replaced impressions;
-    # engagement aggregate removed — individual likes/comments/saves/shares returned instead.
-    # Account level adds: views (total profile views), follows (new followers), profile_visits.
-    "instagram": ["views", "reach", "likes", "comments", "saves", "shares", "follows", "engagement"],
-    "instagram_login": ["views", "reach", "likes", "comments", "saves", "shares", "follows", "engagement"],
-    # FB Page post insights (Graph API v21, post-v20 deprecations): reactions replaces the
-    # old per-type breakdown; unique reach added. Comments and shares are NOT available via
-    # the Page post /insights endpoint in v21 and are excluded to avoid empty columns.
-    "facebook": ["impressions", "reach", "reactions", "clicks", "follows", "engagement"],
+    # IG media insights: reach, views (replaced impressions Apr-2025), likes,
+    # comments, saved, shares, total_interactions; follower growth at account level.
+    "instagram": ["reach", "views", "likes", "comments", "saves", "shares", "follows", "engagement"],
+    "instagram_login": ["reach", "views", "likes", "comments", "saves", "shares", "follows", "engagement"],
+    # FB post insights: impressions, reach (unique), reactions, comments, shares, clicks.
+    "facebook": ["impressions", "reach", "reactions", "comments", "shares", "clicks", "follows", "engagement"],
     # LinkedIn share statistics: impressions, reactions, comments, reposts, clicks, engagement.
     "linkedin_company": ["impressions", "reactions", "comments", "reposts", "clicks", "follows", "engagement"],
     # LinkedIn Personal: only socialActions counts (no impressions/reach per API).

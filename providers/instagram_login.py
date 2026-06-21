@@ -396,10 +396,7 @@ class InstagramLoginProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def get_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
-        # `engagement` was removed from the IG Insights API (deprecated Apr 2025).
-        # `impressions` was replaced by `views` for all media types (Apr 2025).
-        # `saved` is the API name for the saves count.
-        metrics = ["views", "reach", "saved", "likes", "comments", "shares"]
+        metrics = ["impressions", "reach", "engagement", "saved"]
         resp = self._request(
             "GET",
             f"{API_BASE}/{post_id}/insights",
@@ -414,21 +411,17 @@ class InstagramLoginProvider(SocialProvider):
             values[name] = val
 
         return PostMetrics(
-            video_views=values.get("views", 0),
+            impressions=values.get("impressions", 0),
             reach=values.get("reach", 0),
+            engagements=values.get("engagement", 0),
             saves=values.get("saved", 0),
-            likes=values.get("likes", 0),
-            comments=values.get("comments", 0),
-            shares=values.get("shares", 0),
             extra={"raw_insights": values},
         )
 
     def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
         since = int(date_range[0].timestamp())
         until = int(date_range[1].timestamp())
-        # `profile_views` must be requested with metric_type=total_value — batching it
-        # with reach/follower_count in the standard call returns a 400 error.
-        metrics = ["reach", "follower_count"]
+        metrics = ["reach", "follower_count", "profile_views"]
         resp = self._request(
             "GET",
             f"{API_BASE}/me/insights",
@@ -447,24 +440,23 @@ class InstagramLoginProvider(SocialProvider):
             val = entry.get("values", [{}])[0].get("value", 0)
             values[name] = val
 
-        # `views` (total profile views) and `profile_views` both require
-        # metric_type=total_value; fetch them together in one call.
-        total_value_resp = self._request(
+        views_resp = self._request(
             "GET",
             f"{API_BASE}/me/insights",
             access_token=access_token,
             params={
-                "metric": "views,profile_views",
+                "metric": "views",
                 "period": "day",
                 "metric_type": "total_value",
                 "since": since,
                 "until": until,
             },
         )
-        for entry in total_value_resp.json().get("data", []):
-            name = entry.get("name")
-            if name in ("views", "profile_views"):
-                values[name] = entry.get("total_value", {}).get("value", 0)
+        views_data = views_resp.json()
+        for entry in views_data.get("data", []):
+            if entry.get("name") == "views":
+                values["views"] = entry.get("total_value", {}).get("value", 0)
+                break
 
         return AccountMetrics(
             reach=values.get("reach", 0),

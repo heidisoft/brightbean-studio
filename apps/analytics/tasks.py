@@ -98,11 +98,6 @@ _POST_FIELD_OVERRIDES: dict[str, dict[str, str]] = {
         "comments": "replies",
         "shares": "reposts",
     },
-    "facebook": {
-        # providers/facebook.py returns post_reactions_like_total into PostMetrics.likes,
-        # but the catalog key for Facebook reactions is "reactions".
-        "likes": "reactions",
-    },
     "linkedin_company": {
         # providers/linkedin.py:580-585 returns likeCount/shareCount; catalog
         # for linkedin_company uses 'reactions' and 'reposts'.
