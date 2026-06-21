@@ -45,8 +45,9 @@ PLATFORM_METRICS: dict[str, list[str]] = {
     "instagram_login": ["reach", "views", "likes", "comments", "saves", "shares", "follows", "engagement"],
     # FB Graph v21 rejects the old page/post reach + impressions metrics for
     # the production page/post objects we sync today. Use page/profile views
-    # as the reliable visibility-style account metric.
-    "facebook": ["profile_visits", "reactions", "comments", "shares", "clicks", "follows"],
+    # as the reliable visibility-style account metric and page video views
+    # for Facebook's available account-level video view metric.
+    "facebook": ["profile_visits", "views", "reactions", "comments", "shares", "clicks", "follows"],
     # LinkedIn share statistics: impressions, reactions, comments, reposts, clicks, engagement.
     "linkedin_company": ["impressions", "reactions", "comments", "reposts", "clicks", "follows", "engagement"],
     # LinkedIn Personal: only socialActions counts (no impressions/reach per API).
