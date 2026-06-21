@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from urllib.parse import urlencode
@@ -88,7 +89,9 @@ class FacebookProvider(SocialProvider):
         # ``read_insights`` is required for page-level account insights
         # (page_impressions_unique, page_daily_follows). Only requested in
         # OAuth when this platform's analytics is enabled.
-        return ["read_insights"]
+        # ``ads_read`` lets boosted/paid post metrics come from Marketing API
+        # insights when an ``ad_account_id`` is configured.
+        return ["read_insights", "ads_read"]
 
     @property
     def rate_limits(self) -> RateLimitConfig:
@@ -396,14 +399,21 @@ class FacebookProvider(SocialProvider):
         reactions = values.get("post_reactions_by_type_total", {})
         total_reactions = sum(v for v in reactions.values() if isinstance(v, (int, float))) if isinstance(reactions, dict) else 0
         basic = self._get_basic_post_metrics(access_token, post_id)
+        paid = self._get_paid_post_metrics(access_token, post_id)
 
         return PostMetrics(
+            impressions=paid.impressions,
+            reach=paid.reach,
             clicks=values.get("post_clicks", 0),
             likes=total_reactions or basic.likes,
             comments=basic.comments,
             shares=basic.shares,
-            video_views=values.get("post_video_views", 0),
-            extra={"raw_insights": values, "raw_basic": basic.extra.get("raw_fallback", {})},
+            video_views=values.get("post_video_views", 0) or paid.video_views,
+            extra={
+                "raw_insights": values,
+                "raw_basic": basic.extra.get("raw_fallback", {}),
+                "raw_paid": paid.extra.get("raw_paid", {}),
+            },
         )
 
     def _get_basic_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
@@ -439,9 +449,69 @@ class FacebookProvider(SocialProvider):
             raise
         return resp.json().get("shares", {}).get("count", 0)
 
+    def _get_paid_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
+        ad_account_id = str(
+            self.credentials.get("ad_account_id")
+            or self.credentials.get("ads_account_id")
+            or self.credentials.get("facebook_ad_account_id")
+            or ""
+        ).strip()
+        if not ad_account_id:
+            return PostMetrics()
+        if not ad_account_id.startswith("act_"):
+            ad_account_id = f"act_{ad_account_id}"
+
+        try:
+            resp = self._request(
+                "GET",
+                f"{BASE_URL}/{ad_account_id}/insights",
+                access_token=access_token,
+                params={
+                    "fields": "impressions,reach,video_play_actions",
+                    "level": "ad",
+                    "date_preset": "maximum",
+                    "filtering": json.dumps(
+                        [
+                            {
+                                "field": "ad.effective_object_story_id",
+                                "operator": "IN",
+                                "value": [post_id],
+                            }
+                        ]
+                    ),
+                },
+            )
+        except APIError as exc:
+            logger.warning("Facebook paid insights unavailable for post %s: %s", post_id, exc)
+            return PostMetrics()
+
+        rows = resp.json().get("data", [])
+        impressions = sum(self._safe_int(row.get("impressions")) for row in rows)
+        reach = sum(self._safe_int(row.get("reach")) for row in rows)
+        video_views = sum(self._sum_action_values(row.get("video_play_actions"), "video_view") for row in rows)
+        return PostMetrics(
+            impressions=impressions,
+            reach=reach,
+            video_views=video_views,
+            extra={"raw_paid": rows},
+        )
+
+    @staticmethod
+    def _safe_int(value) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _sum_action_values(cls, actions, action_type: str) -> int:
+        if not isinstance(actions, list):
+            return 0
+        return sum(cls._safe_int(item.get("value")) for item in actions if item.get("action_type") == action_type)
+
     def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
         page_id = self.credentials.get("page_id", "me")
-        metrics = ["page_post_engagements", "page_daily_follows", "page_views_total"]
+        metrics = ["page_post_engagements", "page_daily_follows", "page_views_total", "page_video_views"]
         resp = self._request(
             "GET",
             f"{BASE_URL}/{page_id}/insights",
@@ -462,7 +532,7 @@ class FacebookProvider(SocialProvider):
         return AccountMetrics(
             profile_views=values.get("page_views_total", 0),
             followers_gained=values.get("page_daily_follows", 0),
-            extra={"raw_insights": values},
+            extra={"views": values.get("page_video_views", 0), "raw_insights": values},
         )
 
     # ------------------------------------------------------------------

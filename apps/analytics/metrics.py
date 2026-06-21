@@ -43,10 +43,21 @@ PLATFORM_METRICS: dict[str, list[str]] = {
     # comments, saved, shares, total_interactions; follower growth at account level.
     "instagram": ["reach", "views", "likes", "comments", "saves", "shares", "follows", "engagement"],
     "instagram_login": ["reach", "views", "likes", "comments", "saves", "shares", "follows", "engagement"],
-    # FB Graph v21 rejects the old page/post reach + impressions metrics for
-    # the production page/post objects we sync today. Use page/profile views
-    # as the reliable visibility-style account metric.
-    "facebook": ["profile_visits", "reactions", "comments", "shares", "clicks", "follows"],
+    # FB Graph v21 rejects organic page/post reach + impressions metrics for
+    # the production page/post objects we sync today. Paid/boosted post reach
+    # and impressions can still come from Marketing API insights when an ad
+    # account is configured.
+    "facebook": [
+        "profile_visits",
+        "views",
+        "impressions",
+        "reach",
+        "reactions",
+        "comments",
+        "shares",
+        "clicks",
+        "follows",
+    ],
     # LinkedIn share statistics: impressions, reactions, comments, reposts, clicks, engagement.
     "linkedin_company": ["impressions", "reactions", "comments", "reposts", "clicks", "follows", "engagement"],
     # LinkedIn Personal: only socialActions counts (no impressions/reach per API).

@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
@@ -17,6 +18,7 @@ def test_account_metrics_use_current_page_insights_metrics():
                         {"name": "page_post_engagements", "values": [{"value": 34}]},
                         {"name": "page_daily_follows", "values": [{"value": 5}]},
                         {"name": "page_views_total", "values": [{"value": 8}]},
+                        {"name": "page_video_views", "values": [{"value": 13}]},
                     ]
                 }
             )
@@ -34,17 +36,25 @@ def test_account_metrics_use_current_page_insights_metrics():
     assert metrics.reach == 0
     assert metrics.profile_views == 8
     assert metrics.followers_gained == 5
+    assert metrics.extra["views"] == 13
     assert metrics.extra["raw_insights"]["page_post_engagements"] == 34
     provider._request.assert_called_once_with(
         "GET",
         "https://graph.facebook.com/v21.0/page-1/insights",
         access_token="page-token",
         params={
-            "metric": "page_post_engagements,page_daily_follows,page_views_total",
+            "metric": "page_post_engagements,page_daily_follows,page_views_total,page_video_views",
             "since": 1781740800,
             "until": 1781827200,
         },
     )
+
+
+def test_facebook_analytics_scopes_include_ads_read():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+
+    assert "read_insights" in provider.analytics_only_scopes
+    assert "ads_read" in provider.analytics_only_scopes
 
 
 def test_post_metrics_use_supported_facebook_insights_and_basic_counts():
@@ -131,14 +141,97 @@ def test_facebook_post_metrics_persist_reactions_key():
     assert out["clicks"] == 4.0
 
 
+def test_facebook_account_metrics_persist_page_views_and_video_views():
+    from apps.analytics.tasks import _account_metrics_to_dict
+    from providers.types import AccountMetrics
+
+    metrics = AccountMetrics(profile_views=8, followers_gained=5, extra={"views": 13})
+
+    out = _account_metrics_to_dict(metrics, "facebook")
+
+    assert out["profile_visits"] == 8.0
+    assert out["views"] == 13.0
+    assert out["follows"] == 5.0
+
+
+def test_post_metrics_use_paid_insights_when_ad_account_is_configured():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret", "ad_account_id": "123"})
+    provider._request = MagicMock(
+        side_effect=[
+            MagicMock(
+                json=MagicMock(
+                    return_value={
+                        "data": [
+                            {"name": "post_clicks", "values": [{"value": 4}]},
+                            {"name": "post_reactions_by_type_total", "values": [{"value": {"like": 5}}]},
+                            {"name": "post_video_views", "values": [{"value": 0}]},
+                        ]
+                    }
+                )
+            ),
+            MagicMock(
+                json=MagicMock(
+                    return_value={
+                        "id": "page-1_post-1",
+                        "likes": {"summary": {"total_count": 5}},
+                        "comments": {"summary": {"total_count": 3}},
+                    }
+                )
+            ),
+            MagicMock(json=MagicMock(return_value={"id": "page-1_post-1", "shares": {"count": 2}})),
+            MagicMock(
+                json=MagicMock(
+                    return_value={
+                        "data": [
+                            {
+                                "impressions": "100",
+                                "reach": "80",
+                                "video_play_actions": [{"action_type": "video_view", "value": "7"}],
+                            },
+                            {
+                                "impressions": "50",
+                                "reach": "40",
+                                "video_play_actions": [{"action_type": "video_view", "value": "2"}],
+                            },
+                        ]
+                    }
+                )
+            ),
+        ]
+    )
+
+    metrics = provider.get_post_metrics("page-token", "page-1_post-1")
+
+    assert metrics.impressions == 150
+    assert metrics.reach == 120
+    assert metrics.video_views == 9
+    assert metrics.likes == 5
+    paid_call = provider._request.call_args_list[3]
+    assert paid_call.args == ("GET", "https://graph.facebook.com/v21.0/act_123/insights")
+    assert paid_call.kwargs["access_token"] == "page-token"
+    assert paid_call.kwargs["params"]["fields"] == "impressions,reach,video_play_actions"
+    assert paid_call.kwargs["params"]["level"] == "ad"
+    assert paid_call.kwargs["params"]["date_preset"] == "maximum"
+    assert json.loads(paid_call.kwargs["params"]["filtering"]) == [
+        {"field": "ad.effective_object_story_id", "operator": "IN", "value": ["page-1_post-1"]}
+    ]
+
+
 def test_facebook_catalog_uses_supported_metrics():
     from apps.analytics.metrics import PLATFORM_METRICS, PLATFORM_PRIMARY
 
     assert PLATFORM_PRIMARY["facebook"] == "profile_visits"
-    assert "views" not in PLATFORM_METRICS["facebook"]
-    assert "reach" not in PLATFORM_METRICS["facebook"]
-    assert "impressions" not in PLATFORM_METRICS["facebook"]
-    assert {"profile_visits", "reactions", "comments", "shares", "clicks", "follows"} <= set(PLATFORM_METRICS["facebook"])
+    assert {
+        "profile_visits",
+        "views",
+        "impressions",
+        "reach",
+        "reactions",
+        "comments",
+        "shares",
+        "clicks",
+        "follows",
+    } <= set(PLATFORM_METRICS["facebook"])
 
 
 def test_post_metrics_falls_back_for_objects_without_insights_edge():
