@@ -91,6 +91,10 @@ DEFAULT_BACKFILL_DAYS = 90
 # native fields into different ``PostMetrics`` slots — these overrides realign
 # them with the keys the UI queries from ``PLATFORM_METRICS``.
 _POST_FIELD_OVERRIDES: dict[str, dict[str, str]] = {
+    "facebook": {
+        # post_reactions_like_total → PostMetrics.likes, but catalog key is "reactions".
+        "likes": "reactions",
+    },
     "threads": {
         # providers/threads.py:419-423 stuffs views/replies/reposts into the
         # impressions/comments/shares dataclass fields.
