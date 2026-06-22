@@ -420,12 +420,18 @@ class FacebookProvider(SocialProvider):
             "post_clicks",
             "post_reactions_by_type_total",
         ]
-        resp = self._request(
-            "GET",
-            f"{BASE_URL}/{post_id}/insights",
-            access_token=access_token,
-            params={"metric": ",".join(metrics)},
-        )
+        try:
+            resp = self._request(
+                "GET",
+                f"{BASE_URL}/{post_id}/insights",
+                access_token=access_token,
+                params={"metric": ",".join(metrics)},
+            )
+        except APIError as exc:
+            # Personal-profile posts and some post types have no insights endpoint.
+            logger.debug("Facebook post %s has no insights: %s", post_id, exc)
+            return PostMetrics()
+
         data = resp.json()
         values: dict = {}
         for entry in data.get("data", []):
@@ -452,13 +458,14 @@ class FacebookProvider(SocialProvider):
 
     def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
         page_id = self.credentials.get("page_id", "me")
-        metrics = ["page_impressions", "page_impressions_unique", "page_follows"]
+        # page_follows is a page *field*, not an insights metric — fetch it separately.
+        insights_metrics = ["page_impressions", "page_impressions_unique", "page_fans"]
         resp = self._request(
             "GET",
             f"{BASE_URL}/{page_id}/insights",
             access_token=access_token,
             params={
-                "metric": ",".join(metrics),
+                "metric": ",".join(insights_metrics),
                 "since": int(date_range[0].timestamp()),
                 "until": int(date_range[1].timestamp()),
             },
@@ -470,10 +477,23 @@ class FacebookProvider(SocialProvider):
             val = entry.get("values", [{}])[0].get("value", 0)
             values[name] = val
 
+        # Fetch true follower count from the page object (separate from insights).
+        followers = values.get("page_fans", 0)
+        try:
+            page_resp = self._request(
+                "GET",
+                f"{BASE_URL}/{page_id}",
+                access_token=access_token,
+                params={"fields": "followers_count"},
+            )
+            followers = page_resp.json().get("followers_count", followers)
+        except APIError:
+            pass
+
         return AccountMetrics(
             impressions=values.get("page_impressions", 0),
             reach=values.get("page_impressions_unique", 0),
-            followers=values.get("page_follows", 0),
+            followers=followers,
             extra={"raw_insights": values},
         )
 
