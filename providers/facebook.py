@@ -415,8 +415,8 @@ class FacebookProvider(SocialProvider):
 
     def get_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
         metrics = [
-            "post_impressions",
-            "post_engaged_users",
+            "post_media_view",
+            "post_total_media_view_unique",
             "post_clicks",
             "post_reactions_by_type_total",
         ]
@@ -434,11 +434,17 @@ class FacebookProvider(SocialProvider):
             values[name] = val
 
         reactions = values.get("post_reactions_by_type_total", {})
-        total_likes = reactions.get("like", 0) + reactions.get("love", 0) if isinstance(reactions, dict) else 0
+        if isinstance(reactions, dict):
+            total_reactions = sum(reactions.values())
+            total_likes = reactions.get("like", 0) + reactions.get("love", 0)
+        else:
+            total_reactions = 0
+            total_likes = 0
 
         return PostMetrics(
-            impressions=values.get("post_impressions", 0),
-            engagements=values.get("post_engaged_users", 0),
+            impressions=values.get("post_media_view", 0),
+            reach=values.get("post_total_media_view_unique", 0),
+            engagements=total_reactions,
             clicks=values.get("post_clicks", 0),
             likes=total_likes,
             extra={"raw_insights": values},
@@ -446,7 +452,7 @@ class FacebookProvider(SocialProvider):
 
     def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
         page_id = self.credentials.get("page_id", "me")
-        metrics = ["page_impressions", "page_engaged_users", "page_fans"]
+        metrics = ["page_impressions", "page_impressions_unique", "page_follows"]
         resp = self._request(
             "GET",
             f"{BASE_URL}/{page_id}/insights",
@@ -466,8 +472,8 @@ class FacebookProvider(SocialProvider):
 
         return AccountMetrics(
             impressions=values.get("page_impressions", 0),
-            reach=values.get("page_engaged_users", 0),
-            followers=values.get("page_fans", 0),
+            reach=values.get("page_impressions_unique", 0),
+            followers=values.get("page_follows", 0),
             extra={"raw_insights": values},
         )
 
