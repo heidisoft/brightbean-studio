@@ -3,9 +3,11 @@
 from unittest.mock import patch
 
 import pytest
+from django.utils import timezone
 
 from apps.analytics.tasks import sync_all_account_analytics
 from apps.social_accounts.models import AnalyticsPlatformConfig, SocialAccount
+from providers.types import PostMetrics
 
 
 @pytest.fixture
@@ -156,4 +158,49 @@ def test_sync_account_metrics_recovers_followers_from_later_offset(workspace):
     # ...and no past date got a followers row.
     assert not AccountInsightsSnapshot.objects.filter(
         social_account=account, date__lt=today, metric_key="followers"
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_sync_post_metrics_refreshes_stale_uuid_platform_post_id(workspace):
+    """A stale in-memory PlatformPost can still carry an internal UUID even after
+    the DB row has the real Facebook id; refresh once before skipping analytics.
+    """
+    from datetime import date
+    from unittest.mock import MagicMock, patch
+
+    from apps.analytics.models import PostInsightsSnapshot
+    from apps.analytics.tasks import _sync_post_metrics
+    from apps.composer.models import PlatformPost, Post
+
+    account = SocialAccount.objects.create(
+        workspace=workspace,
+        platform="facebook",
+        account_platform_id="200739086715586",
+        account_name="FB Page",
+        oauth_access_token="page-token",
+        connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+    )
+    post = Post.objects.create(workspace=workspace, caption="hello")
+    platform_post = PlatformPost.objects.create(
+        post=post,
+        social_account=account,
+        status=PlatformPost.Status.PUBLISHED,
+        platform_post_id=str(post.id),
+        published_at=timezone.now(),
+    )
+    PlatformPost.objects.filter(pk=platform_post.pk).update(platform_post_id="200739086715586_1333067239012062")
+
+    fake_provider = MagicMock()
+    fake_provider.get_post_metrics.return_value = PostMetrics(comments=3)
+
+    with patch("apps.analytics.tasks._resolve_provider", return_value=fake_provider):
+        _sync_post_metrics(platform_post, date(2026, 6, 24))
+
+    fake_provider.get_post_metrics.assert_called_once_with("page-token", "200739086715586_1333067239012062")
+    assert PostInsightsSnapshot.objects.filter(
+        platform_post=platform_post,
+        date=date(2026, 6, 24),
+        metric_key="comments",
+        value=3,
     ).exists()

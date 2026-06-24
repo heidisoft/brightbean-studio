@@ -525,12 +525,25 @@ def _sync_post_metrics(post, on_date: dt_date) -> None:
     """Fetch this post's current metrics and write today's snapshot rows."""
     account = post.social_account
     if account.platform in {"facebook", "instagram", "instagram_login"} and _looks_like_uuid(post.platform_post_id):
-        logger.warning(
-            "Skipping %s analytics for PlatformPost %s because platform_post_id looks like an internal UUID.",
-            account.platform,
-            post.id,
-        )
-        return
+        original_platform_post_id = post.platform_post_id
+        post.refresh_from_db(fields=["platform_post_id"])
+        if not _looks_like_uuid(post.platform_post_id):
+            logger.info(
+                "Recovered %s analytics for PlatformPost %s after refreshing platform_post_id from %s to %s.",
+                account.platform,
+                post.id,
+                original_platform_post_id,
+                post.platform_post_id,
+            )
+        else:
+            logger.warning(
+                "Skipping %s analytics for PlatformPost %s because platform_post_id %s looks like an internal UUID.",
+                account.platform,
+                post.id,
+                post.platform_post_id,
+            )
+            return
+
     provider = _resolve_provider(account)
     try:
         metrics = provider.get_post_metrics(account.oauth_access_token, post.platform_post_id)

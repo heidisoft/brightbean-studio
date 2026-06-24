@@ -434,7 +434,9 @@ class FacebookProvider(SocialProvider):
             # body making .json() raise). Catch broadly; fall back to video_id.
             logger.debug("Facebook video %s post_id unavailable: %s", video_id, exc)
 
-        post_id = self._page_scoped_post_id(page_id, video_fields["post_id"]) if video_fields.get("post_id") else video_id
+        post_id = (
+            self._page_scoped_post_id(page_id, video_fields["post_id"]) if video_fields.get("post_id") else video_id
+        )
         url = video_fields.get("permalink_url") or f"https://www.facebook.com/{post_id}"
         return PublishResult(
             platform_post_id=post_id,
