@@ -491,8 +491,16 @@ class FacebookProvider(SocialProvider):
 
     def _resolve_post_fields(self, access_token: str, post_id: str) -> tuple[dict, list[str]]:
         fields = self._get_post_fields(access_token, post_id)
-        candidate_ids = [fields.get("post_id")]
+        video_fields: dict = {}
+        if not fields and "_" not in str(post_id):
+            video_fields = self._get_video_post_metadata(access_token, post_id)
+
         page_id = self.credentials.get("page_id")
+        candidate_ids = []
+        for candidate_id in (fields.get("post_id"), video_fields.get("post_id")):
+            if page_id and candidate_id and "_" not in str(candidate_id):
+                candidate_ids.append(f"{page_id}_{candidate_id}")
+            candidate_ids.append(candidate_id)
         if page_id and "_" not in str(post_id):
             candidate_ids.append(f"{page_id}_{post_id}")
         candidate_ids.append(post_id)
@@ -505,9 +513,27 @@ class FacebookProvider(SocialProvider):
                 continue
             feed_fields = self._get_post_fields(access_token, candidate_id)
             if feed_fields:
-                best_fields = {**fields, **feed_fields}
+                best_fields = {**fields, **video_fields, **feed_fields}
                 break
         return best_fields, deduped_candidate_ids
+
+    def _get_video_post_metadata(self, access_token: str, video_id: str) -> dict:
+        """Resolve a bare Facebook video object ID to its feed post ID.
+
+        Legacy rows can store the video node ID when the post-publish metadata
+        lookup was not ready. Full post fields such as ``message`` are invalid
+        on that video node, so ask only for video-supported metadata first.
+        """
+        try:
+            return self._request(
+                "GET",
+                f"{BASE_URL}/{video_id}",
+                access_token=access_token,
+                params={"fields": "post_id,permalink_url"},
+            ).json()
+        except Exception as exc:
+            logger.debug("Facebook video %s post_id unavailable during analytics: %s", video_id, exc)
+            return {}
 
     def _get_post_insights(self, access_token: str, post_ids: list[str]) -> tuple[dict, dict[str, str], str]:
         metric = ",".join(FACEBOOK_POST_INSIGHTS)
