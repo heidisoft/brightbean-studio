@@ -294,9 +294,10 @@ class FacebookProvider(SocialProvider):
             json=payload,
         )
         data = resp.json()
+        post_id = self._page_scoped_post_id(page_id, data["id"])
         return PublishResult(
-            platform_post_id=data["id"],
-            url=f"https://www.facebook.com/{data['id']}",
+            platform_post_id=post_id,
+            url=f"https://www.facebook.com/{post_id}",
             extra=data,
         )
 
@@ -314,7 +315,7 @@ class FacebookProvider(SocialProvider):
             json=payload,
         )
         data = resp.json()
-        post_id = data.get("post_id", data["id"])
+        post_id = self._page_scoped_post_id(page_id, data["post_id"]) if data.get("post_id") else data["id"]
         return PublishResult(platform_post_id=post_id, url=f"https://www.facebook.com/{post_id}", extra=data)
 
     def _publish_multi_photo(self, access_token: str, page_id: str, content: PublishContent) -> PublishResult:
@@ -363,7 +364,7 @@ class FacebookProvider(SocialProvider):
                 access_token=access_token,
                 json=payload,
             ).json()
-            post_id = data.get("id")
+            post_id = self._page_scoped_post_id(page_id, data.get("id"))
             if not post_id:
                 raise PublishError(
                     "Failed to publish Facebook multi-photo post",
@@ -433,7 +434,7 @@ class FacebookProvider(SocialProvider):
             # body making .json() raise). Catch broadly; fall back to video_id.
             logger.debug("Facebook video %s post_id unavailable: %s", video_id, exc)
 
-        post_id = video_fields.get("post_id") or video_id
+        post_id = self._page_scoped_post_id(page_id, video_fields["post_id"]) if video_fields.get("post_id") else video_id
         url = video_fields.get("permalink_url") or f"https://www.facebook.com/{post_id}"
         return PublishResult(
             platform_post_id=post_id,
@@ -490,19 +491,29 @@ class FacebookProvider(SocialProvider):
         )
 
     def _resolve_post_fields(self, access_token: str, post_id: str) -> tuple[dict, list[str]]:
-        fields = self._get_post_fields(access_token, post_id)
+        page_id = self.credentials.get("page_id")
+        primary_post_id = self._page_scoped_post_id(page_id, post_id)
+        fields = self._get_post_fields(access_token, primary_post_id)
+        if primary_post_id != str(post_id) and not fields:
+            logger.warning(
+                "Facebook post fields unavailable for page-scoped id %s; falling back to stored id %s",
+                primary_post_id,
+                post_id,
+            )
+            fields = self._get_post_fields(access_token, post_id)
+
         video_fields: dict = {}
         if not fields and "_" not in str(post_id):
             video_fields = self._get_video_post_metadata(access_token, post_id)
 
-        page_id = self.credentials.get("page_id")
         candidate_ids = []
         for candidate_id in (fields.get("post_id"), video_fields.get("post_id")):
-            if page_id and candidate_id and "_" not in str(candidate_id):
-                candidate_ids.append(f"{page_id}_{candidate_id}")
+            scoped_candidate_id = self._page_scoped_post_id(page_id, candidate_id)
+            if scoped_candidate_id:
+                candidate_ids.append(scoped_candidate_id)
             candidate_ids.append(candidate_id)
-        if page_id and "_" not in str(post_id):
-            candidate_ids.append(f"{page_id}_{post_id}")
+        if primary_post_id:
+            candidate_ids.append(primary_post_id)
         candidate_ids.append(post_id)
 
         deduped_candidate_ids = list(dict.fromkeys(str(candidate_id) for candidate_id in candidate_ids if candidate_id))
@@ -515,6 +526,12 @@ class FacebookProvider(SocialProvider):
             if feed_fields:
                 best_fields = {**fields, **video_fields, **feed_fields}
                 break
+        if not best_fields:
+            logger.warning(
+                "Facebook post fields unavailable for stored id %s after trying candidates: %s",
+                post_id,
+                ", ".join(deduped_candidate_ids),
+            )
         return best_fields, deduped_candidate_ids
 
     def _get_video_post_metadata(self, access_token: str, video_id: str) -> dict:
@@ -532,8 +549,17 @@ class FacebookProvider(SocialProvider):
                 params={"fields": "post_id,permalink_url"},
             ).json()
         except Exception as exc:
-            logger.debug("Facebook video %s post_id unavailable during analytics: %s", video_id, exc)
+            logger.warning("Facebook video %s post_id unavailable during analytics: %s", video_id, exc)
             return {}
+
+    @staticmethod
+    def _page_scoped_post_id(page_id: str | None, post_id: str | None) -> str:
+        if not post_id:
+            return ""
+        post_id = str(post_id)
+        if page_id and "_" not in post_id:
+            return f"{page_id}_{post_id}"
+        return post_id
 
     def _get_post_insights(self, access_token: str, post_ids: list[str]) -> tuple[dict, dict[str, str], str]:
         metric = ",".join(FACEBOOK_POST_INSIGHTS)
@@ -547,11 +573,15 @@ class FacebookProvider(SocialProvider):
                     access_token=access_token,
                     params={"metric": metric},
                 )
+                return parse_insights_response(resp.json()), {}, post_id
             except APIError as exc:
                 errors_by_post_id[post_id] = str(exc)
                 logger.warning("Skipping unsupported Facebook post insights at %s: %s", endpoint, exc)
                 continue
-            return parse_insights_response(resp.json()), {}, post_id
+            except Exception as exc:
+                errors_by_post_id[post_id] = str(exc)
+                logger.warning("Facebook post insights failed at %s: %s", endpoint, exc)
+                continue
 
         error_text = "; ".join(f"{post_id}: {error}" for post_id, error in errors_by_post_id.items())
         return {}, {key: error_text for key in FACEBOOK_POST_INSIGHTS}, post_ids[0] if post_ids else ""
@@ -562,6 +592,7 @@ class FacebookProvider(SocialProvider):
         # invalid-field error. Retry without ``post_id`` so the engagement fields
         # (comments/shares/reactions summaries) still load for normal posts.
         field_sets = (FACEBOOK_POST_FIELDS, [f for f in FACEBOOK_POST_FIELDS if f != "post_id"])
+        last_error: Exception | None = None
         for fields in field_sets:
             try:
                 fields_resp = self._request(
@@ -572,12 +603,18 @@ class FacebookProvider(SocialProvider):
                 )
                 return fields_resp.json()
             except APIError as exc:
+                last_error = exc
                 logger.debug("Facebook post %s fields unavailable: %s", post_id, exc)
                 if "post_id" not in str(exc):
                     # Only the invalid-`post_id`-field error is worth retrying
                     # without it; other errors (auth, 5xx, not-found) fail
                     # identically, so don't issue a second doomed request.
                     break
+            except Exception as exc:
+                last_error = exc
+                break
+        if last_error:
+            logger.warning("Facebook post %s fields unavailable: %s", post_id, last_error)
         return {}
 
     @staticmethod
