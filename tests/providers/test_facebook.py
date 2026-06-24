@@ -481,6 +481,73 @@ def test_get_post_metrics_tries_page_scoped_feed_id_for_numeric_object_id():
     )
 
 
+def test_get_post_metrics_resolves_bare_video_id_to_exact_feed_post_id():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret", "page_id": "page-1"})
+    provider._request = MagicMock(
+        side_effect=[
+            APIError("(#100) Tried accessing nonexisting field (message)", platform="Facebook"),
+            _resp(
+                {
+                    "id": "video-1",
+                    "post_id": "post-2",
+                    "permalink_url": "https://www.facebook.com/page-1/videos/video-1/",
+                }
+            ),
+            _resp(
+                {
+                    "id": "page-1_post-2",
+                    "shares": {"count": 8},
+                    "comments": {"summary": {"total_count": 6}},
+                    "reactions": {"summary": {"total_count": 3}},
+                }
+            ),
+            _resp(
+                {
+                    "data": [
+                        {"name": "post_media_view", "values": [{"value": 90}]},
+                        {"name": "post_total_media_view_unique", "values": [{"value": 70}]},
+                        {"name": "post_clicks", "values": [{"value": 5}]},
+                        {"name": "post_reactions_by_type_total", "values": [{"value": {"like": 3}}]},
+                    ]
+                }
+            ),
+        ]
+    )
+
+    metrics = provider.get_post_metrics("page-token", "video-1")
+
+    assert metrics.video_views == 90
+    assert metrics.reach == 70
+    assert metrics.comments == 6
+    assert metrics.shares == 8
+    assert metrics.extra["insight_post_id"] == "page-1_post-2"
+    assert metrics.extra["attempted_insight_post_ids"] == ["page-1_post-2", "post-2", "page-1_video-1", "video-1"]
+    provider._request.assert_any_call(
+        "GET",
+        "https://graph.facebook.com/v25.0/video-1",
+        access_token="page-token",
+        params={"fields": FACEBOOK_POST_FIELDS_PARAM},
+    )
+    provider._request.assert_any_call(
+        "GET",
+        "https://graph.facebook.com/v25.0/video-1",
+        access_token="page-token",
+        params={"fields": "post_id,permalink_url"},
+    )
+    provider._request.assert_any_call(
+        "GET",
+        "https://graph.facebook.com/v25.0/page-1_post-2",
+        access_token="page-token",
+        params={"fields": FACEBOOK_POST_FIELDS_PARAM},
+    )
+    provider._request.assert_any_call(
+        "GET",
+        "https://graph.facebook.com/v25.0/page-1_post-2/insights",
+        access_token="page-token",
+        params={"metric": FACEBOOK_POST_INSIGHTS_PARAM},
+    )
+
+
 def test_get_post_metrics_tries_next_candidate_when_feed_id_has_no_insights_edge():
     provider = FacebookProvider({"client_id": "id", "client_secret": "secret", "page_id": "page-1"})
     provider._request = MagicMock(
