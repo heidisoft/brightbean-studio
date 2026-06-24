@@ -137,6 +137,43 @@ def test_publish_single_photo_uses_photos_edge_without_staging():
     assert "attached_media" not in sent
 
 
+def test_publish_text_scopes_bare_feed_post_id_to_page():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(return_value=_resp({"id": "post-1"}))
+
+    result = provider.publish_post(
+        "page-token",
+        PublishContent(text="Caption", post_type=PostType.TEXT, extra={"page_id": "page-1"}),
+    )
+
+    assert result.platform_post_id == "page-1_post-1"
+    assert result.url == "https://www.facebook.com/page-1_post-1"
+
+
+def test_publish_video_scopes_bare_feed_post_id_to_page():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(
+        side_effect=[
+            _resp({"id": "video-1"}),
+            _resp({"post_id": "post-1", "permalink_url": "https://www.facebook.com/page-1/videos/video-1/"}),
+        ]
+    )
+
+    result = provider.publish_post(
+        "page-token",
+        PublishContent(
+            text="Video caption",
+            media_urls=["https://cdn.example.com/clip.mp4"],
+            post_type=PostType.VIDEO,
+            extra={"page_id": "page-1"},
+        ),
+    )
+
+    assert result.platform_post_id == "page-1_post-1"
+    assert result.url == "https://www.facebook.com/page-1/videos/video-1/"
+    assert result.extra["video_id"] == "video-1"
+
+
 def test_is_video_url_ignores_query_string():
     """Presigned URLs carry query strings; the check must look at the path only."""
     assert FacebookProvider._is_video_url("https://cdn.example.com/clip.mp4?X-Amz-Sig=abc&x=1") is True
@@ -485,6 +522,7 @@ def test_get_post_metrics_resolves_bare_video_id_to_exact_feed_post_id():
     provider = FacebookProvider({"client_id": "id", "client_secret": "secret", "page_id": "page-1"})
     provider._request = MagicMock(
         side_effect=[
+            APIError("(#10) Object does not exist", platform="Facebook"),
             APIError("(#100) Tried accessing nonexisting field (message)", platform="Facebook"),
             _resp(
                 {
@@ -524,7 +562,7 @@ def test_get_post_metrics_resolves_bare_video_id_to_exact_feed_post_id():
     assert metrics.extra["attempted_insight_post_ids"] == ["page-1_post-2", "post-2", "page-1_video-1", "video-1"]
     provider._request.assert_any_call(
         "GET",
-        "https://graph.facebook.com/v25.0/video-1",
+        "https://graph.facebook.com/v25.0/page-1_video-1",
         access_token="page-token",
         params={"fields": FACEBOOK_POST_FIELDS_PARAM},
     )
