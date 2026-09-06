@@ -4,10 +4,13 @@ Covers create / edit / discard / send, the failed-send retry path, and
 the SLA auto-resolve side effect — independently of any HTTP surface.
 """
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import timedelta
+from threading import Event
 from unittest.mock import patch
 
 import pytest
+from django.db import connection, connections
 from django.utils import timezone
 
 from apps.inbox import services
@@ -161,3 +164,101 @@ def test_send_reply_convenience_removes_failed_row(message):
     ):
         services.send_reply(message=message, body="answer")
     assert InboxReply.objects.filter(inbox_message=message).count() == 0
+
+
+@pytest.mark.parametrize("operation", ["send", "edit", "discard"])
+def test_stale_draft_cannot_change_sent_reply(message, operation):
+    reply = services.create_reply_draft(message=message, body="answer")
+    stale_reply = InboxReply.objects.get(pk=reply.pk)
+    with patch("apps.inbox.services._dispatch_to_platform", return_value="sent-1") as dispatch:
+        services.send_reply_now(reply)
+        with pytest.raises(services.ReplyStateError):
+            if operation == "send":
+                services.send_reply_now(stale_reply)
+            elif operation == "edit":
+                services.update_reply_draft(stale_reply, body="different answer")
+            else:
+                services.discard_reply_draft(stale_reply)
+    dispatch.assert_called_once()
+    reply.refresh_from_db()
+    assert reply.status == InboxReply.Status.SENT
+    assert reply.body == "answer"
+
+
+def test_send_uses_latest_saved_draft(message):
+    reply = services.create_reply_draft(message=message, body="original")
+    latest = InboxReply.objects.get(pk=reply.pk)
+    services.update_reply_draft(latest, body="approved answer")
+    with patch("apps.inbox.services._dispatch_to_platform", return_value="sent-1") as dispatch:
+        services.send_reply_now(reply)
+    assert dispatch.call_args.args[1] == "approved answer"
+    assert reply.body == "approved answer"
+
+
+def test_discarded_reply_cannot_be_sent_from_stale_instance(message):
+    reply = services.create_reply_draft(message=message, body="answer")
+    services.discard_reply_draft(InboxReply.objects.get(pk=reply.pk))
+    with (
+        patch("apps.inbox.services._dispatch_to_platform") as dispatch,
+        pytest.raises(services.ReplyStateError, match="discarded"),
+    ):
+        services.send_reply_now(reply)
+    dispatch.assert_not_called()
+
+
+def test_sla_failure_does_not_make_delivered_reply_sendable_again(message):
+    reply = services.create_reply_draft(message=message, body="answer")
+    with (
+        patch("apps.inbox.services._dispatch_to_platform", return_value="sent-1") as dispatch,
+        patch("apps.inbox.services._apply_post_send_side_effects", side_effect=RuntimeError("SLA failed")),
+    ):
+        assert services.send_reply_now(reply).status == InboxReply.Status.SENT
+        reply.refresh_from_db()
+        assert reply.status == InboxReply.Status.SENT
+        assert reply.platform_reply_id == "sent-1"
+        with pytest.raises(services.ReplyStateError):
+            services.send_reply_now(reply)
+    dispatch.assert_called_once()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_sends_deliver_draft_once(message):
+    if not connection.features.has_select_for_update:
+        pytest.skip("Requires database row locks")
+    reply = services.create_reply_draft(message=message, body="answer")
+    stale_reply = InboxReply.objects.get(pk=reply.pk)
+    dispatch_started = Event()
+    release_dispatch = Event()
+    second_started = Event()
+
+    def dispatch(message, body):
+        dispatch_started.set()
+        assert release_dispatch.wait(timeout=10)
+        return "sent-once"
+
+    def send(instance, started=None):
+        try:
+            if started is not None:
+                started.set()
+            return services.send_reply_now(instance).status
+        finally:
+            connections.close_all()
+
+    with patch("apps.inbox.services._dispatch_to_platform", side_effect=dispatch) as mocked_dispatch:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(send, reply)
+            try:
+                assert dispatch_started.wait(timeout=10)
+                second = executor.submit(send, stale_reply, second_started)
+                assert second_started.wait(timeout=10)
+                with pytest.raises(TimeoutError):
+                    second.result(timeout=0.2)
+            finally:
+                release_dispatch.set()
+            assert first.result(timeout=10) == InboxReply.Status.SENT
+            with pytest.raises(services.ReplyStateError, match="cannot be sent again"):
+                second.result(timeout=10)
+        mocked_dispatch.assert_called_once()
+    reply.refresh_from_db()
+    assert reply.status == InboxReply.Status.SENT
+    assert reply.platform_reply_id == "sent-once"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 from django.test import Client
@@ -267,11 +268,15 @@ class TestReplyDrafts:
         from unittest.mock import patch
 
         reply = InboxReply.objects.create(inbox_message=message, body="ready")
-        with patch("apps.inbox.services._dispatch_to_platform", side_effect=RuntimeError("no")):
+        with patch(
+            "apps.inbox.services._dispatch_to_platform", side_effect=RuntimeError("access_token=private-provider-token")
+        ):
             r = api.post(f"/api/v1/inbox/replies/{reply.id}/send")
         assert r.status_code == 502
         reply.refresh_from_db()
         assert reply.status == InboxReply.Status.FAILED
+        assert r.json()["detail"] == f"Reply not sent: {reply.send_error}"
+        assert "private-provider-token" not in r.content.decode()
 
     def test_delete_draft(self, api, message):
         reply = InboxReply.objects.create(inbox_message=message, body="scrap")
@@ -289,3 +294,129 @@ class TestReplyDrafts:
         reply = InboxReply.objects.create(inbox_message=m, body="x")
         r = api.delete(f"/api/v1/inbox/replies/{reply.id}")
         assert r.status_code == 404
+
+
+@pytest.mark.django_db
+class TestReplyIdempotency:
+    @pytest.mark.parametrize("header_key", [False, True])
+    @pytest.mark.parametrize("send", [False, True])
+    def test_create_replays_without_duplicate_reply_or_send(self, api, message, header_key, send):
+        payload = {"body": "thanks", "send": send}
+        headers = {"HTTP_IDEMPOTENCY_KEY": "reply-once"} if header_key else {}
+        if not header_key:
+            payload["idempotency_key"] = "reply-once"
+        with patch("apps.inbox.services._dispatch_to_platform", return_value="platform-reply") as dispatch:
+            responses = [
+                api.post(
+                    f"/api/v1/inbox/{message.id}/replies",
+                    data=json.dumps(payload),
+                    content_type="application/json",
+                    **headers,
+                )
+                for _ in range(2)
+            ]
+        assert [r.status_code for r in responses] == [201, 201]
+        assert responses[0].json() == responses[1].json()
+        assert InboxReply.objects.filter(inbox_message=message).count() == 1
+        assert dispatch.call_count == int(send)
+
+    @pytest.mark.parametrize("changed_field", ["body", "send", "message"])
+    def test_reused_key_with_different_intent_is_rejected(self, api, message, changed_field):
+        url = f"/api/v1/inbox/{message.id}/replies"
+        payload = {"body": "thanks", "send": False, "idempotency_key": "same-key"}
+        first = api.post(url, data=json.dumps(payload), content_type="application/json")
+        assert first.status_code == 201
+        if changed_field == "message":
+            other = _message(message.social_account, platform_message_id="pm-another")
+            url = f"/api/v1/inbox/{other.id}/replies"
+        else:
+            payload[changed_field] = "changed" if changed_field == "body" else True
+        with patch("apps.inbox.services._dispatch_to_platform") as dispatch:
+            second = api.post(url, data=json.dumps(payload), content_type="application/json")
+        assert second.status_code == 422
+        assert InboxReply.objects.count() == 1
+        dispatch.assert_not_called()
+
+    def test_pending_claim_prevents_creation(self, api, message, full_key):
+        from apps.api.middleware import claim_idempotency_slot, fingerprint_request
+        from apps.api.schemas import CreateReplyRequest
+
+        url = f"/api/v1/inbox/{message.id}/replies"
+        payload = CreateReplyRequest(body="thanks", send=True, idempotency_key="pending")
+        claim_idempotency_slot(
+            api_key=full_key.api_key,
+            idempotency_key="pending",
+            fingerprint=fingerprint_request("POST", url, payload.model_dump(mode="json")),
+        )
+        with patch("apps.inbox.services._dispatch_to_platform") as dispatch:
+            response = api.post(url, data=payload.model_dump_json(), content_type="application/json")
+        assert response.status_code == 409
+        assert InboxReply.objects.count() == 0
+        dispatch.assert_not_called()
+
+    def test_validation_failure_releases_header_claim(self, api, message, full_key):
+        from apps.api.models import IdempotencyRecord
+
+        url = f"/api/v1/inbox/{message.id}/replies"
+        response = api.post(
+            url,
+            data=json.dumps({"body": "   "}),
+            content_type="application/json",
+            HTTP_IDEMPOTENCY_KEY="retry-validation",
+        )
+        assert response.status_code == 422
+        assert not IdempotencyRecord.objects.filter(api_key=full_key.api_key, key="retry-validation").exists()
+        retry = api.post(
+            url,
+            data=json.dumps({"body": "fixed"}),
+            content_type="application/json",
+            HTTP_IDEMPOTENCY_KEY="retry-validation",
+        )
+        assert retry.status_code == 201
+
+    def test_provider_failure_is_sanitized_and_replayed(self, api, message):
+        payload = {"body": "thanks", "send": True, "idempotency_key": "failed-send"}
+        with patch(
+            "apps.inbox.services._dispatch_to_platform", side_effect=RuntimeError("access_token=private-provider-token")
+        ) as dispatch:
+            responses = [
+                api.post(
+                    f"/api/v1/inbox/{message.id}/replies", data=json.dumps(payload), content_type="application/json"
+                )
+                for _ in range(2)
+            ]
+        assert [r.status_code for r in responses] == [502, 502]
+        assert responses[0].json() == responses[1].json()
+        reply = InboxReply.objects.get(inbox_message=message)
+        assert reply.status == InboxReply.Status.FAILED
+        assert responses[0].json()["detail"] == f"Reply not sent: {reply.send_error}"
+        assert "private-provider-token" not in responses[0].content.decode()
+        dispatch.assert_called_once()
+
+    def test_body_key_takes_precedence_over_header(self, api, message, full_key):
+        from apps.api.models import IdempotencyRecord
+
+        response = api.post(
+            f"/api/v1/inbox/{message.id}/replies",
+            data=json.dumps({"body": "thanks", "idempotency_key": "body-key"}),
+            content_type="application/json",
+            HTTP_IDEMPOTENCY_KEY="header-key",
+        )
+        assert response.status_code == 201
+        assert IdempotencyRecord.objects.filter(api_key=full_key.api_key, key="body-key").exists()
+        assert not IdempotencyRecord.objects.filter(api_key=full_key.api_key, key="header-key").exists()
+
+    def test_response_storage_failure_does_not_allow_duplicate_send(self, api, message):
+        payload = {"body": "thanks", "send": True, "idempotency_key": "response-failed"}
+        url = f"/api/v1/inbox/{message.id}/replies"
+        api.raise_request_exception = False
+        with patch("apps.inbox.services._dispatch_to_platform", return_value="platform-reply") as dispatch:
+            with patch(
+                "apps.api.routers.inbox.finalize_idempotent_response", side_effect=RuntimeError("storage failed")
+            ):
+                first = api.post(url, data=json.dumps(payload), content_type="application/json")
+            retry = api.post(url, data=json.dumps(payload), content_type="application/json")
+        assert first.status_code == 500
+        assert retry.status_code == 409
+        assert InboxReply.objects.get(inbox_message=message).status == InboxReply.Status.SENT
+        dispatch.assert_called_once()

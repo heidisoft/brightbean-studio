@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -12,8 +13,10 @@ from django.utils import timezone
 
 from apps.api_keys import services
 from apps.inbox.models import InboxMessage, InboxReply
-from apps.mcp.protocol import INVALID_PARAMS
+from apps.mcp.handlers import _send_reply
+from apps.mcp.protocol import INVALID_PARAMS, JsonRpcError
 from apps.members.models import PERMISSION_KEYS, OrgMembership, WorkspaceMembership
+from providers.exceptions import RateLimitError, TokenExpiredError
 
 MCP_URL = "/api/v1/mcp/"
 
@@ -218,16 +221,55 @@ class TestInboxReplyTools:
 
     def test_send_reply_with_reply_id(self, full_client, message):
         reply = InboxReply.objects.create(inbox_message=message, body="ready")
-        with patch("apps.inbox.services._dispatch_to_platform", return_value="plat-1"):
+        with patch("apps.inbox.services._dispatch_to_platform", return_value="plat-1") as dispatch:
             _s, body = _call(full_client, "send_reply", {"reply_id": str(reply.id)})
         assert _result_json(body)["status"] == "sent"
+        dispatch.assert_called_once_with(message, "ready")
+        assert message.replies.count() == 1
 
     def test_send_reply_create_and_send(self, full_client, message):
-        with patch("apps.inbox.services._dispatch_to_platform", return_value="plat-2"):
+        with patch("apps.inbox.services._dispatch_to_platform", return_value="plat-2") as dispatch:
             _s, body = _call(full_client, "send_reply", {"message_id": str(message.id), "body": "yo"})
         data = _result_json(body)
         assert data["status"] == "sent"
         assert data["platform_reply_id"] == "plat-2"
+        dispatch.assert_called_once_with(message, "yo")
+        assert message.replies.count() == 1
+
+    @pytest.mark.parametrize("extra_fields", [("message_id",), ("body",), ("message_id", "body")])
+    def test_send_reply_rejects_mixed_modes_without_side_effects(self, full_client, message, extra_fields):
+        reply = InboxReply.objects.create(inbox_message=message, body="reviewed draft")
+        values = {"message_id": str(message.id), "body": "replacement text"}
+        arguments = {"reply_id": str(reply.id), **{key: values[key] for key in extra_fields}}
+
+        with patch("apps.inbox.services._dispatch_to_platform") as dispatch:
+            _s, body = _call(full_client, "send_reply", arguments)
+
+        assert body["error"]["code"] == INVALID_PARAMS
+        dispatch.assert_not_called()
+        reply.refresh_from_db()
+        assert reply.status == InboxReply.Status.DRAFT
+        assert reply.body == "reviewed draft"
+        assert message.replies.count() == 1
+
+    @pytest.mark.parametrize("reply_id", ["existing-reply", "", None])
+    @pytest.mark.parametrize("extra_fields", [{"message_id": "message"}, {"body": "new text"}])
+    def test_send_reply_handler_rejects_mixed_modes_before_resolving_reply(self, reply_id, extra_fields):
+        context = {
+            "membership": SimpleNamespace(effective_permissions={"reply_from_inbox": True}),
+            "api_key": SimpleNamespace(issued_by_id=None),
+        }
+        with (
+            patch("apps.mcp.handlers._get_inbox_reply_for_key") as get_reply,
+            patch("apps.mcp.handlers.create_reply_draft") as create,
+            patch("apps.mcp.handlers.send_reply_now") as send,
+            pytest.raises(JsonRpcError, match="cannot be combined"),
+        ):
+            _send_reply({"reply_id": reply_id, **extra_fields}, context)
+
+        get_reply.assert_not_called()
+        create.assert_not_called()
+        send.assert_not_called()
 
     def test_send_reply_requires_reply_from_inbox(self, draft_only_client, message):
         reply = InboxReply.objects.create(inbox_message=message, body="ready")
@@ -239,14 +281,23 @@ class TestInboxReplyTools:
         _s, body = _call(draft_only_client, "create_reply_draft", {"message_id": str(message.id), "body": "d"})
         assert _result_json(body)["status"] == "draft"
 
-    def test_send_reply_platform_failure_is_reshaped(self, full_client, message):
-        reply = InboxReply.objects.create(inbox_message=message, body="ready")
-        with patch("apps.inbox.services._dispatch_to_platform", side_effect=RuntimeError("no")):
-            _s, body = _call(full_client, "send_reply", {"reply_id": str(reply.id)})
+    @pytest.mark.parametrize("exception_type", [RuntimeError, RateLimitError, TokenExpiredError])
+    @pytest.mark.parametrize("existing_draft", [True, False])
+    def test_send_reply_platform_failure_is_reshaped(self, full_client, message, exception_type, existing_draft):
+        if existing_draft:
+            reply = InboxReply.objects.create(inbox_message=message, body="ready")
+            arguments = {"reply_id": str(reply.id)}
+        else:
+            arguments = {"message_id": str(message.id), "body": "ready"}
+        diagnostic = "provider raw JSON with access_token=private-provider-token"
+        with patch("apps.inbox.services._dispatch_to_platform", side_effect=exception_type(diagnostic)):
+            _s, body = _call(full_client, "send_reply", arguments)
         assert body["error"]["code"] == INVALID_PARAMS
-        assert "reply not sent" in body["error"]["message"].lower()
-        reply.refresh_from_db()
+        reply = message.replies.get()
         assert reply.status == InboxReply.Status.FAILED
+        assert reply.send_error
+        assert body["error"]["message"] == f"Reply not sent: {reply.send_error}"
+        assert "private-provider-token" not in json.dumps(body)
 
     def test_reply_on_foreign_account_is_not_found(self, full_client, other_account):
         m = InboxMessage.objects.create(

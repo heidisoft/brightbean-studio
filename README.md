@@ -662,7 +662,9 @@ Rate-limit responses (`429`) include `Retry-After`, `X-RateLimit-Limit`, and `X-
 | `DELETE` | `/inbox/replies/{reply_id}` | Discard a draft reply | `use_inbox` |
 | `POST` | `/mcp` | JSON-RPC 2.0 endpoint for MCP clients | — |
 
-All write endpoints accept `idempotency_key` (or `Idempotency-Key` header) for safe retries.
+Post creation, media uploads, and inbox reply creation accept `idempotency_key` (or `Idempotency-Key` header) for safe retries.
+
+For inbox reply creation, reuse the same key and request to replay the original response without creating or sending another reply. A failed create-and-send response is replayed too; retrieve the retained failed reply from the message thread and retry delivery via `/inbox/replies/{reply_id}/send`.
 
 ### MCP Tools
 

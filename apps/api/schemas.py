@@ -725,6 +725,11 @@ class InboxMessagesListResponse(Schema):
 
 class CreateReplyRequest(Schema):
     body: str = Field(..., min_length=1, max_length=10_000, description="The reply text.")
+    idempotency_key: str | None = Field(
+        None,
+        max_length=128,
+        description="Optional client-chosen retry key. Same key + same body → replay first response.",
+    )
     send: bool = Field(
         False,
         description=(

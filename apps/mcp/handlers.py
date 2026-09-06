@@ -1531,9 +1531,10 @@ def _send_reply(args: dict, context: dict[str, Any]) -> dict:
     api_key = context["api_key"]
     actor = api_key.issued_by if api_key.issued_by_id else None
 
-    reply_id = args.get("reply_id")
-    if reply_id:
-        reply = _get_inbox_reply_for_key(api_key, reply_id)
+    if "reply_id" in args and ("message_id" in args or "body" in args):
+        raise JsonRpcError(INVALID_PARAMS, "reply_id cannot be combined with message_id or body")
+    if "reply_id" in args:
+        reply = _get_inbox_reply_for_key(api_key, args["reply_id"])
     else:
         if "message_id" not in args or not args.get("body"):
             raise JsonRpcError(
@@ -1554,7 +1555,7 @@ def _send_reply(args: dict, context: dict[str, Any]) -> dict:
     except ReplyStateError as exc:
         raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
     except Exception as exc:  # platform refused it — reply is left in "failed"
-        raise JsonRpcError(INVALID_PARAMS, f"Reply not sent: {exc}") from exc
+        raise JsonRpcError(INVALID_PARAMS, f"Reply not sent: {reply.send_error or 'Please try again later.'}") from exc
 
     return _wrap_text(_serialize_inbox_reply(reply))
 
@@ -1583,6 +1584,13 @@ register_tool(
                 },
                 "body": {"type": "string", "minLength": 1, "maxLength": 10000},
             },
+            "oneOf": [
+                {
+                    "required": ["reply_id"],
+                    "not": {"anyOf": [{"required": ["message_id"]}, {"required": ["body"]}]},
+                },
+                {"required": ["message_id", "body"], "not": {"required": ["reply_id"]}},
+            ],
             "additionalProperties": False,
         },
         handler=_send_reply,

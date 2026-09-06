@@ -22,7 +22,13 @@ from ninja import Query, Router
 from ninja.errors import HttpError
 
 from apps.api.limits import enforce_http_rate_limits
-from apps.api.middleware import log_audit_entry
+from apps.api.middleware import (
+    claim_idempotency_slot,
+    finalize_idempotent_response,
+    fingerprint_request,
+    log_audit_entry,
+    release_idempotent_claim,
+)
 from apps.api.pagination import decode_offset_cursor, encode_offset_cursor
 from apps.api.schemas import (
     CreateReplyRequest,
@@ -154,6 +160,24 @@ def create_reply(request, message_id: uuid.UUID, payload: CreateReplyRequest):
         _require_perm(request, "reply_from_inbox")
 
     message = _get_message(request, message_id)
+    idempotency_key = payload.idempotency_key or request.headers.get("Idempotency-Key") or None
+    fingerprint = fingerprint_request(request.method or "POST", request.path, payload.model_dump(mode="json"))
+    try:
+        disposition, replay_status, replay_body = claim_idempotency_slot(
+            api_key=request.api_key,
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint,
+        )
+    except ValueError as exc:
+        raise HttpError(422, str(exc)) from exc
+    if disposition == "replay":
+        assert replay_status is not None and replay_body is not None
+        if replay_status >= 400:
+            raise HttpError(replay_status, replay_body["detail"])
+        return replay_status, replay_body
+    if disposition == "in_flight":
+        raise HttpError(409, "An identical request with this idempotency_key is still in flight; retry shortly.")
+
     try:
         reply = create_reply_draft(
             message=message,
@@ -161,20 +185,42 @@ def create_reply(request, message_id: uuid.UUID, payload: CreateReplyRequest):
             author=request.user if not request.user.is_anonymous else None,
         )
     except ValueError as exc:
+        release_idempotent_claim(api_key=request.api_key, idempotency_key=idempotency_key)
         raise HttpError(422, str(exc)) from exc
+    except Exception:
+        release_idempotent_claim(api_key=request.api_key, idempotency_key=idempotency_key)
+        raise
 
-    if payload.send:
-        try:
-            send_reply_now(reply, actor=request.user if not request.user.is_anonymous else None)
-        except NotImplementedError:
-            pass  # provider has no reply API; the local draft is recorded as sent
-        except ReplyStateError as exc:
-            raise HttpError(409, str(exc)) from exc
-        except Exception as exc:  # platform refused it — reply is left in "failed"
-            raise HttpError(502, f"Reply not sent: {exc}") from exc
+    # Once a draft exists, retain the claim even on failure: replaying a
+    # create-and-send request must never create another reply or send twice.
+    try:
+        if payload.send:
+            try:
+                send_reply_now(reply, actor=request.user if not request.user.is_anonymous else None)
+            except NotImplementedError:
+                pass  # provider has no reply API; the local draft is recorded as sent
+            except ReplyStateError as exc:
+                raise HttpError(409, str(exc)) from exc
+            except Exception as exc:  # platform refused it — reply is left in "failed"
+                raise HttpError(502, f"Reply not sent: {reply.send_error or 'Please try again later.'}") from exc
 
-    log_audit_entry(request, action="inbox.reply.create", target_id=reply.id, status_code=201)
-    return 201, InboxReplyResponse.from_reply(reply)
+        body = InboxReplyResponse.from_reply(reply)
+        log_audit_entry(request, action="inbox.reply.create", target_id=reply.id, status_code=201)
+        finalize_idempotent_response(
+            api_key=request.api_key,
+            idempotency_key=idempotency_key,
+            status_code=201,
+            body=body.model_dump(mode="json"),
+        )
+        return 201, body
+    except HttpError as exc:
+        finalize_idempotent_response(
+            api_key=request.api_key,
+            idempotency_key=idempotency_key,
+            status_code=exc.status_code,
+            body={"detail": exc.message},
+        )
+        raise
 
 
 @router.patch("/replies/{reply_id}", response=InboxReplyResponse, summary="Edit a draft reply")
@@ -204,7 +250,7 @@ def send_reply(request, reply_id: uuid.UUID):
     except ReplyStateError as exc:
         raise HttpError(409, str(exc)) from exc
     except Exception as exc:
-        raise HttpError(502, f"Reply not sent: {exc}") from exc
+        raise HttpError(502, f"Reply not sent: {reply.send_error or 'Please try again later.'}") from exc
     log_audit_entry(request, action="inbox.reply.send", target_id=reply.id, status_code=200)
     return InboxReplyResponse.from_reply(reply)
 

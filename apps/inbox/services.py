@@ -131,8 +131,18 @@ def create_reply_draft(*, message: InboxMessage, body: str, author=None) -> Inbo
     )
 
 
+def _lock_reply(reply: InboxReply) -> None:
+    """Refresh the caller's instance while locking the row for this transaction."""
+    try:
+        reply.refresh_from_db(from_queryset=InboxReply.objects.select_for_update())
+    except InboxReply.DoesNotExist as exc:
+        raise ReplyStateError("This reply has been discarded.") from exc
+
+
+@transaction.atomic
 def update_reply_draft(reply: InboxReply, *, body: str) -> InboxReply:
     """Edit a draft (or failed) reply's body."""
+    _lock_reply(reply)
     if reply.status not in _SENDABLE_STATUSES:
         raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be edited.")
     body = (body or "").strip()
@@ -143,8 +153,10 @@ def update_reply_draft(reply: InboxReply, *, body: str) -> InboxReply:
     return reply
 
 
+@transaction.atomic
 def discard_reply_draft(reply: InboxReply) -> None:
     """Delete a draft (or failed) reply. Sent replies are permanent."""
+    _lock_reply(reply)
     if reply.status not in _SENDABLE_STATUSES:
         raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be discarded.")
     reply.delete()
@@ -160,36 +172,49 @@ def send_reply_now(reply: InboxReply, *, actor=None) -> InboxReply:
     the reply is recorded locally with an empty ``platform_reply_id``,
     matching the pre-existing behaviour.
     """
-    if reply.status not in _SENDABLE_STATUSES:
-        raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be sent again.")
+    failure = None
+    with transaction.atomic():
+        # Keep the lock through delivery and persistence. Every competing send,
+        # edit or discard must check the latest state after acquiring this lock.
+        _lock_reply(reply)
+        if reply.status not in _SENDABLE_STATUSES:
+            raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be sent again.")
 
-    message = reply.inbox_message
-    if actor is not None and reply.author_id is None:
-        reply.author = actor
+        message = reply.inbox_message
+        if actor is not None and reply.author_id is None:
+            reply.author = actor
 
+        try:
+            platform_reply_id = _dispatch_to_platform(message, reply.body)
+        except NotImplementedError:
+            logger.info(
+                "Provider %s cannot send replies; recording reply %s locally.",
+                message.social_account.platform,
+                reply.id,
+            )
+            platform_reply_id = ""
+        except Exception as exc:
+            logger.exception("Failed to send inbox reply %s (%s)", reply.id, message.social_account.platform)
+            reply.status = InboxReply.Status.FAILED
+            reply.send_error = _reply_failure_reason(exc)
+            reply.save(update_fields=["status", "send_error", "author", "updated_at"])
+            failure = exc
+
+        if failure is None:
+            reply.status = InboxReply.Status.SENT
+            reply.platform_reply_id = platform_reply_id
+            reply.send_error = ""
+            reply.sent_at = timezone.now()
+            reply.save(update_fields=["status", "platform_reply_id", "send_error", "sent_at", "author", "updated_at"])
+
+    # Raising inside atomic would roll back the failed status and its reason.
+    if failure is not None:
+        raise failure
+    # SLA bookkeeping must not roll back a reply already delivered externally.
     try:
-        platform_reply_id = _dispatch_to_platform(message, reply.body)
-    except NotImplementedError:
-        logger.info(
-            "Provider %s cannot send replies; recording reply %s locally.",
-            message.social_account.platform,
-            reply.id,
-        )
-        platform_reply_id = ""
-    except Exception as exc:
-        logger.exception("Failed to send inbox reply %s (%s)", reply.id, message.social_account.platform)
-        reply.status = InboxReply.Status.FAILED
-        reply.send_error = _reply_failure_reason(exc)
-        reply.save(update_fields=["status", "send_error", "author", "updated_at"])
-        raise
-
-    reply.status = InboxReply.Status.SENT
-    reply.platform_reply_id = platform_reply_id
-    reply.send_error = ""
-    reply.sent_at = timezone.now()
-    reply.save(update_fields=["status", "platform_reply_id", "send_error", "sent_at", "author", "updated_at"])
-
-    _apply_post_send_side_effects(message)
+        _apply_post_send_side_effects(message)
+    except Exception:
+        logger.exception("Inbox reply %s was sent, but updating the message status failed", reply.id)
     return reply
 
 
