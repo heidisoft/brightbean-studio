@@ -122,6 +122,13 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
+# Optional inbox reply extension; all feature settings and assets live in its app.
+INBOX_AI_ENABLED = env.bool("INBOX_AI_ENABLED", default=False)
+if INBOX_AI_ENABLED:
+    from apps.inbox_ai.configuration import configure as configure_inbox_ai
+
+    configure_inbox_ai(globals(), env)
+
 # Cache (used by rate limiting, session fallback)
 REDIS_URL = env("REDIS_URL")
 if REDIS_URL:

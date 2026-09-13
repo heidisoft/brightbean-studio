@@ -99,5 +99,10 @@ if settings.INTELLIGENCE_ENABLED:
         ),
     ]
 
+if settings.INBOX_AI_ENABLED:
+    urlpatterns += [
+        path("workspace/<uuid:workspace_id>/inbox/ai/", include("apps.inbox_ai.urls")),
+    ]
+
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

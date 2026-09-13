@@ -1,0 +1,6 @@
+/* Allow the upstream composer footer to accommodate an extra action on mobile. */
+form:has([data-generate-url]) > div:last-child,
+form:has([data-generate-url]) > div:last-child > div {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
