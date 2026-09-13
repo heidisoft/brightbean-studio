@@ -21,6 +21,12 @@ def _mark_existing_sent(apps, schema_editor):
     for reply in InboxReply.objects.exclude(sent_at=None).iterator():
         InboxReply.objects.filter(pk=reply.pk).update(created_at=reply.sent_at)
 
+    if schema_editor.connection.vendor == "postgresql":
+        # AddField(db_index=True) queues CREATE INDEX until the schema editor
+        # exits. Drain the backfill's deferred FK checks before that DDL runs,
+        # keeping both the schema changes and backfill in one atomic migration.
+        schema_editor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+
 
 def _noop(apps, schema_editor):
     pass
