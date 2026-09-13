@@ -1,0 +1,7 @@
+{% extends "inbox/message_detail.html" %}
+{% load static %}
+{% block extra_head %}
+{{ block.super }}
+<link rel="stylesheet" href="{% static 'inbox_ai/reply.css' %}">
+<script src="{% static 'inbox_ai/reply.js' %}" defer></script>
+{% endblock %}

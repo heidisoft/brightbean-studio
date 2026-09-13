@@ -1,0 +1,54 @@
+{% if enabled %}
+<div class="relative" x-data="inboxReplyAI"
+     data-generate-url="{% url 'inbox_ai:generate' workspace_id=workspace.id message_id=message.id %}"
+     @keydown.escape.stop.prevent="open = false; $refs.trigger.focus()">
+    <button type="button" x-ref="trigger" @click="open = !open"
+            :aria-expanded="open" aria-controls="inbox-ai-{{ message.id }}"
+            class="inline-flex items-center gap-1.5 px-4 py-1.5 text-[12px] font-semibold text-stone-600 rounded-full border border-stone-200 hover:bg-stone-50 transition-all cursor-pointer">
+        AI reply
+    </button>
+    <div id="inbox-ai-{{ message.id }}" x-show="open" x-cloak @click.outside="open = false"
+         class="absolute right-0 bottom-full mb-2 bg-white rounded-lg shadow-lg border border-stone-200 p-3 z-50 space-y-3 overflow-y-auto"
+         style="width: 350px; max-width: calc(100vw - 48px); max-height: 60vh;"
+         :aria-busy="busy">
+        <div class="flex items-center justify-between">
+            <p class="text-[13px] font-semibold text-stone-800">Generate a reply</p>
+            <button type="button" @click="open = false; $refs.trigger.focus()" aria-label="Close AI replies"
+                    class="text-stone-500 px-2 py-1">&times;</button>
+        </div>
+        <p class="text-[11px] text-stone-500">Matches the message's language, including Sinhala. The linked Studio post and conversation are included when available.</p>
+        <label class="block text-[12px] font-medium text-stone-700">
+            Article text (optional)
+            <textarea x-model="article" :disabled="busy" maxlength="{{ article_limit }}" rows="3"
+                      placeholder="Paste the full article or extra context. Links alone do not include article text."
+                      class="mt-1 w-full px-3 py-2 text-[12px] bg-white border border-stone-200 rounded-lg resize-none focus:outline-none focus:border-orange-400"></textarea>
+        </label>
+        <p class="text-[10px] text-stone-400">Choosing a style sends this context to OpenAI. Review facts and tone before sending.</p>
+        <div class="grid grid-cols-2 gap-2">
+            {% for style in styles %}
+            <button type="button" @click="generate('{{ style.id }}')" :disabled="busy"
+                    class="text-left px-3 py-2 rounded-lg border border-stone-200 hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed">
+                <span class="block text-[12px] font-semibold text-stone-800">{{ style.label }}</span>
+                <span class="block text-[11px] text-stone-500">{{ style.description }}</span>
+            </button>
+            {% endfor %}
+        </div>
+        <p x-show="busy" role="status" class="text-[12px] text-stone-500">Generating a reply…</p>
+        <p x-show="error" x-text="error" role="alert" class="text-[12px] text-red-700"></p>
+        <div x-show="suggestion" class="space-y-2">
+            <label class="block text-[12px] font-medium text-stone-700">
+                Suggested reply
+                <textarea x-model="suggestion" rows="4" :disabled="busy" dir="auto"
+                          class="mt-1 w-full px-3 py-2 text-[13px] bg-white border border-stone-200 rounded-lg"></textarea>
+            </label>
+            <button type="button" :disabled="busy || !suggestion.trim()"
+                    @click="replyText = suggestion; open = false; $el.closest('form').querySelector('textarea[name=body]').focus()"
+                    class="px-4 py-1.5 text-[12px] font-semibold text-white rounded-full disabled:opacity-40"
+                    style="background: var(--primary);">
+                Use reply
+            </button>
+            <p class="text-[10px] text-stone-400">Replaces the composer text. You can edit, save as draft, or send it.</p>
+        </div>
+    </div>
+</div>
+{% endif %}

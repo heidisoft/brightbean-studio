@@ -72,6 +72,7 @@
                             class="inline-flex items-center gap-1.5 px-4 py-1.5 text-[12px] font-semibold text-stone-600 rounded-full border border-stone-200 hover:bg-stone-50 transition-all duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">
                         Save as draft
                     </button>
+                    {% block reply_extensions %}{% endblock %}
                     <button type="submit"
                             class="btn-primary-hover inline-flex items-center gap-1.5 px-4 py-1.5 text-[12px] font-semibold text-white rounded-full transition-all duration-150 cursor-pointer"
                             style="background: var(--primary); box-shadow: var(--shadow-primary);">

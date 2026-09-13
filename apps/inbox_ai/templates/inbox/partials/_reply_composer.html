@@ -1,0 +1,6 @@
+{% extends "inbox/partials/_reply_composer.html" %}
+{% load inbox_ai %}
+{% block reply_extensions %}
+{{ block.super }}
+{% inbox_ai_button %}
+{% endblock %}

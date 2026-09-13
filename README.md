@@ -581,6 +581,10 @@ No developer app registration needed. Users connect by entering a personal **API
 
 Posts publish as DEV.to articles (title + Markdown body). The key can be revoked at any time from the same settings page.
 
+## Inbox: Optional AI Reply Generator
+
+Add an **AI reply** button with configurable reply styles, language matching (including Sinhala), and article context using the OpenAI API. It is an optional Django extension with minimal core hooks for reapplying after upstream upgrades. See the [extension setup and upgrade guide](apps/inbox_ai/README.md).
+
 ## Inbox: Backfill Historical Messages
 
 See the [Supported Platforms](#supported-platforms) matrix above for per-platform inbox capabilities.
