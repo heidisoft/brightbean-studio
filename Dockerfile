@@ -23,10 +23,14 @@ COPY . .
 # Build Tailwind CSS
 RUN cd theme/static_src && npm ci && npm run build
 
-# Collect static files
+# Collect static files. INBOX_AI_ENABLED is forced on here (independent of
+# the runtime env var) so apps.inbox_ai is registered and its assets land in
+# the manifest — otherwise enabling the feature at runtime 404s/500s on
+# inbox_ai/reply.css because whitenoise's manifest is immutable after build.
 RUN DJANGO_SETTINGS_MODULE=config.settings.production \
     SECRET_KEY=build-placeholder \
     DATABASE_URL=sqlite:///tmp/build.db \
+    INBOX_AI_ENABLED=True \
     python manage.py collectstatic --noinput
 
 EXPOSE 8000
