@@ -14,8 +14,11 @@ from apps.workspaces.models import Workspace
 @pytest.fixture(autouse=True)
 def ai_settings(settings):
     settings.INBOX_AI_ENABLED = True
+    settings.INBOX_AI_PROVIDER = "openai"
     settings.INBOX_AI_API_KEY = "test-placeholder"
     settings.INBOX_AI_MODEL = "gpt-4.1-mini"
+    settings.INBOX_AI_GEMINI_API_KEY = "test-placeholder"
+    settings.INBOX_AI_GEMINI_MODEL = "gemini-2.5-pro"
     settings.INBOX_AI_PROMPTS = load_prompts(APP_DIR / "prompts.json")
     if "apps.inbox_ai" not in settings.INSTALLED_APPS:
         settings.INSTALLED_APPS = [*settings.INSTALLED_APPS, "apps.inbox_ai"]

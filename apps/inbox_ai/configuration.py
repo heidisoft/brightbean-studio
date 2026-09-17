@@ -39,6 +39,11 @@ def configure(namespace, env):
     # Django's same-name template inheritance skips this override when resolving
     # its parent, so upstream composer/layout changes are inherited automatically.
     namespace["TEMPLATES"][0]["DIRS"].insert(0, APP_DIR / "templates")
+    namespace["INBOX_AI_PROVIDER"] = env("INBOX_AI_PROVIDER", default="openai")
+    if namespace["INBOX_AI_PROVIDER"] not in ("openai", "gemini"):
+        raise ImproperlyConfigured("INBOX_AI_PROVIDER must be 'openai' or 'gemini'.")
     namespace["INBOX_AI_API_KEY"] = env("OPENAI_API_KEY", default="")
     namespace["INBOX_AI_MODEL"] = env("INBOX_AI_MODEL", default="gpt-4.1-mini")
+    namespace["INBOX_AI_GEMINI_API_KEY"] = env("GEMINI_API_KEY", default="")
+    namespace["INBOX_AI_GEMINI_MODEL"] = env("INBOX_AI_GEMINI_MODEL", default="gemini-2.5-pro")
     namespace["INBOX_AI_PROMPTS"] = load_prompts(env("INBOX_AI_PROMPTS_FILE", default=str(APP_DIR / "prompts.json")))
