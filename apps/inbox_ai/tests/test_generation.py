@@ -133,6 +133,7 @@ def test_gemini_provider_failures_are_safe(ai_settings, status):
         {"candidates": []},
         gemini_completed("  "),
         {"candidates": [{"finishReason": "SAFETY", "content": {"parts": [{"text": "blocked"}]}}]},
+        {"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": "truncated mid-sen"}]}}]},
         {"promptFeedback": {"blockReason": "SAFETY"}, "candidates": []},
     ],
 )

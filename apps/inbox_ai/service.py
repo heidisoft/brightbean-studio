@@ -113,10 +113,13 @@ def _generate_gemini(context, style):
                 "A reply could not be generated for this content. Try another style or write your reply."
             )
         candidate = data["candidates"][0]
-        if candidate.get("finishReason") in ("SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST"):
+        finish_reason = candidate.get("finishReason")
+        if finish_reason in ("SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"):
             raise GenerationError(
                 "A reply could not be generated for this content. Try another style or write your reply."
             )
+        if finish_reason != "STOP":
+            raise ValueError(f"Unexpected finish reason: {finish_reason}")
         reply = "".join(part.get("text", "") for part in candidate["content"]["parts"]).strip()
         if not reply or len(reply) > 12000:
             raise ValueError("Empty or oversized output")
