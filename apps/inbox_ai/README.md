@@ -1,14 +1,16 @@
-# OpenAI inbox reply extension
+# AI inbox reply extension
 
 Optional Django app for BrightBean Studio. Adds **AI reply** beside **Send Reply**.
-Choose fact-based, funny/sarcastic, friendly, professional, short, or bullet-point
-replies; choosing a style immediately generates an editable suggestion. **Use
+Choose fact-based, fact-based opinionated, funny/sarcastic, friendly, professional,
+short, or bullet-point replies; choosing a style immediately generates an editable
+suggestion. **Use
 reply** copies it to the existing composer, where the user can edit, save, or send.
 Generation never sends a reply or creates a database record.
 
 ## Enable
 
-Set these in your deployment environment (or local `.env`) and restart Studio:
+Set these in your deployment environment (or local `.env`) and restart Studio.
+The default provider is OpenAI:
 
 ```dotenv
 INBOX_AI_ENABLED=true
@@ -16,11 +18,24 @@ OPENAI_API_KEY=your-server-side-openai-key
 INBOX_AI_MODEL=gpt-4.1-mini
 ```
 
-Run your usual static asset build and `collectstatic` during deployment. No new
-Python dependency, migration, background worker, or external extension service is
-needed. `httpx` is already a Studio dependency. The model is configurable and must
-support the OpenAI Responses API. A missing key produces an actionable error in
-the picker; it does not stop Studio from starting. Disabled by default.
+To use Gemini instead, set `INBOX_AI_PROVIDER=gemini` and its own key/model:
+
+```dotenv
+INBOX_AI_ENABLED=true
+INBOX_AI_PROVIDER=gemini
+GEMINI_API_KEY=your-server-side-gemini-key
+INBOX_AI_GEMINI_MODEL=gemini-2.5-pro
+```
+
+`INBOX_AI_PROVIDER` is a single site-wide switch (default `openai`); there is no
+per-request or per-workspace provider choice. Run your usual static asset build
+and `collectstatic` during deployment. No new Python dependency, migration,
+background worker, or external extension service is needed — `httpx` is already
+a Studio dependency and both providers are called over their plain REST APIs
+(OpenAI's Responses API, Gemini's `generateContent` endpoint). The model is
+configurable per provider. A missing key or invalid `INBOX_AI_PROVIDER` produces
+an actionable error; the latter fails fast at startup, the former only when a
+reply is requested. Disabled by default.
 
 ## Prompts and languages
 
@@ -58,17 +73,20 @@ prompt tells the model to acknowledge missing facts rather than invent them.
 The request includes the target message (up to 6,000 characters), up to five
 parent messages, eight recent sent account replies (2,000 characters each), the
 linked title/caption (1,000 / 24,000 characters), and pasted article text (up to
-24,000 characters, validated before calling OpenAI). Longer stored context is
+24,000 characters, validated before calling the provider). Longer stored context is
 truncated. Internal notes, unsent drafts, credentials, arbitrary metadata, and
 sender profile fields are excluded. Pasted text is kept only in the current
 browser component and generation request, not persisted by the extension.
 
-Content is sent to OpenAI when a style is selected. The API key and prompts stay
-server-side. Requests use `store: false`; this disables Responses storage, not all
-provider-side retention. Input JSON is separated from trusted instructions and
-the prompt treats article/message text as untrusted content. No tools are exposed
-to the model. API errors are sanitized and no content or credentials are logged
-by this app.
+Content is sent to the configured provider (OpenAI or Gemini) when a style is
+selected. The API key and prompts stay server-side. OpenAI requests use
+`store: false`, which disables Responses storage, not all provider-side
+retention; check Google's current data-handling terms for Gemini API retention,
+since this extension does not add any additional opt-out beyond what the plain
+`generateContent` endpoint provides. Input JSON is separated from trusted
+instructions and the prompt treats article/message text as untrusted content. No
+tools are exposed to the model. API errors are sanitized and no content or
+credentials are logged by this app.
 
 ## Architecture and upstream upgrades
 
@@ -117,10 +135,10 @@ Each user/workspace may make 10 generation requests per fixed minute, backed by
 Django's default cache. A shared cache is necessary to make this limit aggregate
 across web workers; with Studio's default local-memory cache it applies per
 process. The client disables repeat generation while a request is running.
-There are no automatic paid retries. OpenAI calls have a 20-second read timeout
+There are no automatic paid retries. Provider calls have a 20-second read timeout
 and a 1,800-token output budget; incomplete/refused/empty output is rejected.
 The browser times out after 25 seconds and aborts on panel destruction. A browser
-abort cannot guarantee cancellation of a request already received by OpenAI.
+abort cannot guarantee cancellation of a request already received by the provider.
 
 Errors leave both the current composer text and any prior suggestion intact.
 Generated content is assigned to textarea values, never rendered as HTML.
@@ -134,14 +152,16 @@ ruff check apps/inbox_ai config/settings/base.py config/urls.py
 ruff format --check apps/inbox_ai config/settings/base.py config/urls.py
 ```
 
-Tests mock OpenAI: they do not spend API credits. They cover tenant/permission
-boundaries, CSRF, input validation, rate limits, contextual article selection,
-exclusion of private material, Unicode payloads, API errors, response validation,
-and template inheritance. Also run the existing inbox suite with
-`INBOX_AI_ENABLED=true` to verify the installed configuration. For a live check,
-open a Sinhala comment, paste its article, select a style, review the suggestion,
-and use/save it. Check naturalness with a Sinhala speaker; mocked tests cannot
-evaluate model language quality.
+Tests mock both providers: they do not spend API credits. They cover
+tenant/permission boundaries, CSRF, input validation, rate limits, contextual
+article selection, exclusion of private material, Unicode payloads, API errors,
+response validation, and template inheritance. Also run the existing inbox suite
+with `INBOX_AI_ENABLED=true` to verify the installed configuration. For a live
+check, open a Sinhala comment, paste its article, select a style, review the
+suggestion, and use/save it. Check naturalness with a Sinhala speaker; mocked
+tests cannot evaluate model language quality.
 
-API contract: [OpenAI Responses create reference](https://developers.openai.com/api/reference/cli/resources/responses/methods/create).
-Default model: [GPT-4.1 mini documentation](https://developers.openai.com/api/docs/models/gpt-4.1-mini).
+OpenAI API contract: [Responses create reference](https://developers.openai.com/api/reference/cli/resources/responses/methods/create).
+Default OpenAI model: [GPT-4.1 mini documentation](https://developers.openai.com/api/docs/models/gpt-4.1-mini).
+Gemini API contract: [generateContent reference](https://ai.google.dev/api/generate-content).
+Default Gemini model: [Gemini 2.5 Pro documentation](https://ai.google.dev/gemini-api/docs/models#gemini-2.5-pro).
