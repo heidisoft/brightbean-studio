@@ -130,19 +130,44 @@ if INBOX_AI_ENABLED:
     configure_inbox_ai(globals(), env)
 
 # Cache (used by rate limiting, session fallback)
+#
+# The "filmstrip" alias holds the composer frame picker's strips: ~8 base64
+# JPEGs each, orders of magnitude larger than anything else we cache. It is a
+# separate alias so those entries can never crowd out the cache everyone else
+# shares — but it is spelled out per backend rather than derived from
+# ``default``, because ``LOCATION`` means different things to the two: a bare
+# namespace for LocMemCache, and the *connection URL* for RedisCache. Copying
+# ``default`` and overriding LOCATION would point the Redis alias at a server
+# named "filmstrip" and fail every frame-picker request on any deployment that
+# sets REDIS_URL.
 REDIS_URL = env("REDIS_URL")
 if REDIS_URL:
     CACHES = {
         "default": {
             "BACKEND": "django.core.cache.backends.redis.RedisCache",
             "LOCATION": REDIS_URL,
-        }
+        },
+        # Shared and out of the web process entirely; Redis's own eviction
+        # policy bounds it, so no MAX_ENTRIES here (LocMem-only anyway).
+        "filmstrip": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+            "KEY_PREFIX": "filmstrip",
+        },
     }
 else:
     CACHES = {
         "default": {
             "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        }
+        },
+        # In-process and per gunicorn worker, so this one has to be bounded:
+        # the default MAX_ENTRIES of 300 would be tens of MB of resident
+        # memory on a box already tight for it.
+        "filmstrip": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "filmstrip",
+            "OPTIONS": {"MAX_ENTRIES": 32, "CULL_FREQUENCY": 2},
+        },
     }
 
 # Database
@@ -192,6 +217,9 @@ STORAGES = {
 # Media files
 STORAGE_BACKEND = env("STORAGE_BACKEND")
 if STORAGE_BACKEND.lower() == "s3":
+    # Object storage hands out its own presigned URLs; this process never
+    # serves MEDIA_ROOT, so the env var is deliberately ignored here.
+    SERVE_MEDIA = False
     STORAGES["default"] = {
         "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
     }
@@ -205,6 +233,14 @@ if STORAGE_BACKEND.lower() == "s3":
     AWS_DEFAULT_ACL = "private"
     AWS_QUERYSTRING_AUTH = True
     AWS_QUERYSTRING_EXPIRE = 3600  # 1-hour expiry for presigned URLs
+    # django-storages spools every object it READS into a SpooledTemporaryFile
+    # sized by this setting. Its own default is 0 — and CPython's spool check is
+    # ``if max_size and pos > max_size``, so 0 is falsy and the spool NEVER rolls
+    # over to disk: each read holds the whole object in the process heap, and the
+    # freed buffer is not returned to the OS. A 120 MB video cost 120 MB of
+    # permanent RSS, which is what pushed the Heroku worker past its quota into an
+    # R15 kill mid-publish. Any non-zero value makes the spool behave as intended.
+    AWS_S3_MAX_MEMORY_SIZE = env.int("AWS_S3_MAX_MEMORY_SIZE", default=2 * 1024 * 1024)
     AWS_S3_OBJECT_PARAMETERS = {
         "CacheControl": "max-age=86400",
     }
@@ -216,6 +252,7 @@ else:
     }
     MEDIA_ROOT = env("MEDIA_ROOT", default=str(BASE_DIR / "media"))
     MEDIA_URL = "/media/"
+    SERVE_MEDIA = env.bool("SERVE_MEDIA", default=True)
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
@@ -259,6 +296,7 @@ SOCIALACCOUNT_EMAIL_AUTHENTICATION = True
 SOCIALACCOUNT_EMAIL_AUTHENTICATION_AUTO_CONNECT = True
 SOCIALACCOUNT_AUTO_SIGNUP = True
 SOCIALACCOUNT_LOGIN_ON_GET = False
+ACCOUNT_ADAPTER = "apps.accounts.adapters.AccountAdapter"
 SOCIALACCOUNT_ADAPTER = "apps.accounts.adapters.SocialAccountAdapter"
 
 # Sessions
@@ -272,15 +310,39 @@ SESSION_SAVE_EVERY_REQUEST = True  # Sliding window
 EMAIL_BACKEND_TYPE = env("EMAIL_BACKEND_TYPE")
 DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="noreply@localhost")
 
+# Everything outbound goes through the budget wrapper, which then hands the
+# message to EMAIL_INNER_BACKEND. There is no send_email() helper in this
+# codebase — six places build EmailMultiAlternatives inline and allauth builds
+# its own — so this is the only point where a runaway loop can be stopped.
+EMAIL_BACKEND = "apps.common.mail.BudgetedEmailBackend"
+
 if EMAIL_BACKEND_TYPE == "smtp":
-    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    EMAIL_INNER_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
     EMAIL_HOST = env("EMAIL_HOST", default="localhost")
     EMAIL_PORT = env.int("EMAIL_PORT", default=587)
     EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")
     EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")
     EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=True)
 else:
-    EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+    EMAIL_INNER_BACKEND = "django.core.mail.backends.console.EmailBackend"
+
+# Outbound email budget (apps/common/mail.py). A negative limit means unlimited
+# and 0 means send nothing — that way round on purpose, so that an operator
+# typing 0 mid-incident gets what they plainly meant. Counters are kept either
+# way, because the count is what tells us where the limit belongs.
+# EMAIL_SENDING_ENABLED=false is the blunt lever, and needs a config change
+# rather than a deploy.
+EMAIL_SENDING_ENABLED = env.bool("EMAIL_SENDING_ENABLED", default=True)
+EMAIL_DAILY_SEND_LIMIT = env.int("EMAIL_DAILY_SEND_LIMIT", default=2000)
+EMAIL_RECIPIENT_HOURLY_LIMIT = env.int("EMAIL_RECIPIENT_HOURLY_LIMIT", default=6)
+EMAIL_RECIPIENT_DAILY_LIMIT = env.int("EMAIL_RECIPIENT_DAILY_LIMIT", default=20)
+RESEND_WEBHOOK_SECRET = env("RESEND_WEBHOOK_SECRET", default="")
+
+# Invitations. The cooldown and the send cap live on the Invitation row so they
+# survive a cache flush; the per-org daily cap uses the email budget counters.
+INVITE_RESEND_COOLDOWN_SECONDS = env.int("INVITE_RESEND_COOLDOWN_SECONDS", default=300)
+INVITE_MAX_SENDS = env.int("INVITE_MAX_SENDS", default=3)
+INVITE_MAX_PER_ORG_PER_DAY = env.int("INVITE_MAX_PER_ORG_PER_DAY", default=25)
 
 # Tailwind
 TAILWIND_APP_NAME = "theme"
@@ -357,16 +419,22 @@ SENTRY_DSN = env("SENTRY_DSN")
 if SENTRY_DSN:
     import sentry_sdk
 
+    # Both rates are env-tunable because the profiler keeps stack samples in
+    # memory, which a 512 MB dyno cannot spare. Profiling defaults to off; turn
+    # it on deliberately when you are actually chasing a regression.
     sentry_sdk.init(
         dsn=SENTRY_DSN,
-        traces_sample_rate=0.1,
-        profiles_sample_rate=0.1,
+        traces_sample_rate=env.float("SENTRY_TRACES_SAMPLE_RATE", default=0.1),
+        profiles_sample_rate=env.float("SENTRY_PROFILES_SAMPLE_RATE", default=0.0),
     )
 
 # Platform credentials env vars (cloud version)
 _META_CREDENTIALS = {
     "app_id": env("PLATFORM_FACEBOOK_APP_ID", default=""),
     "app_secret": env("PLATFORM_FACEBOOK_APP_SECRET", default=""),
+    # Optional Facebook Login for Business configuration. When present Meta
+    # controls the permission and business-asset selection through this config.
+    "config_id": env("PLATFORM_FACEBOOK_CONFIG_ID", default=""),
 }
 _GOOGLE_CREDENTIALS = {
     "client_id": env("PLATFORM_GOOGLE_CLIENT_ID", default=""),
@@ -467,6 +535,25 @@ PLATFORM_CREDENTIALS_FROM_ENV = {
 # from settings that did not exist, so neither could be tuned or overridden.
 PUBLISHER_FIRST_COMMENT_DELAY = env.int("PUBLISHER_FIRST_COMMENT_DELAY", default=120)
 PUBLISHER_FIRST_COMMENT_MAX_RETRIES = env.int("PUBLISHER_FIRST_COMMENT_MAX_RETRIES", default=3)
+# How long a PlatformPost may sit in ``publishing`` before the confirmation sweep
+# gives up on it. STALE applies to a row we never got a platform handle for —
+# the worker died mid-publish and nothing will ever finish it. CONFIRM applies to
+# a row whose platform (TikTok) accepted the upload and is still processing it;
+# that legitimately takes minutes, so it gets a much longer leash.
+PUBLISHER_STALE_PUBLISHING_TIMEOUT = env.int("PUBLISHER_STALE_PUBLISHING_TIMEOUT", default=900)
+PUBLISHER_PUBLISH_CONFIRM_TIMEOUT = env.int("PUBLISHER_PUBLISH_CONFIRM_TIMEOUT", default=1800)
+# Publisher concurrency. MAX_CONCURRENT_PUBLISHES is a row limit on the due
+# query; the other two are a *Postgres connection budget*. Every thread the
+# publish engine spawns takes its own connection (Django connections are
+# thread-local), so POSTS + PLATFORM_PUBLISHES plus the web dyno's gunicorn
+# threads have to stay under the connection limit the whole database ROLE gets.
+# That is 20 on heroku-postgresql:essential-0, which a per-group platform pool
+# exceeded on its own and took production down on 2026-09-15. Raise these only
+# alongside the Postgres plan. Like the timeouts above, they were read via
+# getattr() from settings that did not exist, so none could be tuned.
+PUBLISHER_MAX_CONCURRENT_PUBLISHES = env.int("PUBLISHER_MAX_CONCURRENT_PUBLISHES", default=10)
+PUBLISHER_MAX_CONCURRENT_POSTS = env.int("PUBLISHER_MAX_CONCURRENT_POSTS", default=4)
+PUBLISHER_MAX_CONCURRENT_PLATFORM_PUBLISHES = env.int("PUBLISHER_MAX_CONCURRENT_PLATFORM_PUBLISHES", default=6)
 
 # Webhook verification
 FACEBOOK_WEBHOOK_VERIFY_TOKEN = env("FACEBOOK_WEBHOOK_VERIFY_TOKEN", default="")
