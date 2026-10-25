@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import IO
 
 import httpx
 
-from .exceptions import APIError, ProviderError, RateLimitError
+from .exceptions import APIError, ProviderError, PublishError, RateLimitError
 from .types import (
     AccountMetrics,
     AccountProfile,
@@ -33,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0
 
+# Shown to the user as-is (a PublishError message passes through). Retryable,
+# so it must not promise anything that stops being true once retries run out.
+INTERRUPTED_WAIT_MESSAGE = "Publishing was interrupted by a restart while the platform was still processing the media."
+
 
 class SocialProvider(ABC):
     """Abstract base class that all social platform providers must implement.
@@ -42,8 +47,31 @@ class SocialProvider(ABC):
     Per-user OAuth tokens are passed as method arguments.
     """
 
+    # What this instance has spent since the counter was last reset, for
+    # platforms that meter a budget worth tracking. Zero everywhere else, and on
+    # any call that does not touch it — so a caller can always read it, and
+    # reads nothing alarming from a provider that has no such budget.
+    #
+    # It exists because the cost of a call is not visible from its result: a
+    # comment poll that returns three messages may have bought one page or five,
+    # and only the provider knows which. YouTube is the case that needs it —
+    # 10,000 Data API units a day across every connected channel, spent a page
+    # at a time — and without this the first sign of an exhausted budget is a
+    # user reporting their accounts have gone dead. See apps.inbox.tasks.
+    #
+    # Accumulates rather than being reset per call, because one logical poll can
+    # be several calls: the YouTube inbox retries once after an auth failure,
+    # and a per-call counter would report only the retry while the units the
+    # first attempt bought vanished from the tally. Callers reset it once per
+    # unit of work via :meth:`reset_quota_counter`.
+    last_call_quota_units: int = 0
+
     def __init__(self, credentials: dict | None = None):
         self.credentials = credentials or {}
+
+    def reset_quota_counter(self) -> None:
+        """Start a fresh tally for the next unit of work on this instance."""
+        self.last_call_quota_units = 0
 
     # ------------------------------------------------------------------
     # Class-level metadata (abstract properties)
@@ -391,6 +419,35 @@ class SocialProvider(ABC):
 
         return response
 
+    def _poll_until(
+        self,
+        check: Callable[[], bool],
+        *,
+        deadline: float,
+        interval: float,
+        on_timeout: Callable[[], Exception],
+        should_stop: Callable[[], bool] | None = None,
+    ) -> None:
+        """Call ``check`` until it returns True, sleeping ``interval`` in between.
+
+        For platforms that process media after accepting it. ``check`` raises
+        for a terminal failure; ``deadline`` is a ``time.monotonic()`` value so
+        several waits can share one budget. When the worker is stopping, the
+        wait ends with a retryable error so the engine reschedules the attempt
+        before the platform's shutdown grace period runs out. That is checked
+        before every call to ``check``, including the first: ``check`` usually
+        makes a request, and one started after SIGTERM can by itself outlast
+        the grace period.
+        """
+        while True:
+            if should_stop is not None and should_stop():
+                raise PublishError(INTERRUPTED_WAIT_MESSAGE, platform=self.platform_name)
+            if check():
+                return
+            if time.monotonic() >= deadline:
+                raise on_timeout()
+            time.sleep(interval)
+
     def _error_for_response(self, response: httpx.Response) -> ProviderError:
         """Map an error response to the exception this provider wants raised.
 
@@ -407,7 +464,7 @@ class SocialProvider(ABC):
         """
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
-            logger.error("%s API 429 response: %s", self.platform_name, response.text[:1000])
+            logger.error("%s API request was rate limited (HTTP 429)", self.platform_name)
             return RateLimitError(
                 f"Rate limit exceeded for {self.platform_name}: {response.text[:500]}",
                 retry_after=int(retry_after) if retry_after else None,

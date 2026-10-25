@@ -21,6 +21,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.utils import timezone
 from django.utils.html import strip_tags
+from django.utils.text import get_text_list
 from django.views.decorators.http import require_GET, require_POST
 
 from apps.common.validators import (
@@ -29,10 +30,12 @@ from apps.common.validators import (
     parse_and_truncate_youtube_tag_string,
     safe_xml_fromstring,
 )
+from apps.media_library.models import MediaAsset
 from apps.members.decorators import require_permission
 from apps.members.models import WorkspaceMembership
 from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
+from providers import is_video_only, requires_media
 from providers.tiktok import VALID_PRIVACY_LEVELS as TIKTOK_PRIVACY_LEVELS
 
 from .forms import ContentCategoryForm, PostForm
@@ -48,6 +51,14 @@ from .models import (
     PostTemplate,
     PostVersion,
     Tag,
+)
+from .services import (
+    media_blocker,
+    media_change_blocker,
+    post_media_types,
+    publish_blocker,
+    require_publishable,
+    usable_media_types,
 )
 from .status import READONLY_STATUSES, derive_post_status
 
@@ -373,8 +384,76 @@ def _validate_pinterest_board_selection(request, post, workspace):
     return None
 
 
+# Actions that commit a post to publishing. A draft may still be waiting for
+# its media, so saving one is never blocked on it.
+_PUBLISH_COMMITTING_ACTIONS = frozenset(
+    {
+        "schedule",
+        "publish_now",
+        "add_to_queue",
+        "add_to_queue_priority",
+        "submit_for_approval",
+        "resubmit_for_approval",
+    }
+)
+
+
+def _composer_media_types(request, post, workspace) -> set[str]:
+    """Usable media types on the post plus the uploads waiting to be attached."""
+    media_types = post_media_types(post)
+    # A post that has never been saved keeps its uploads in the session until
+    # save_post attaches them, after this check has run.
+    if post._state.adding:
+        pending_ids = request.session.get(f"pending_media_{workspace.id}", [])
+        media_types |= usable_media_types(MediaAsset.objects.filter(id__in=pending_ids, workspace=workspace))
+    return media_types
+
+
+def _validate_required_media(request, post, workspace, action):
+    """Refuse to schedule a post without the media a selected platform needs.
+
+    TikTok and YouTube publish only video; Instagram and Pinterest need an
+    image or a video. Their providers refuse anything else, so such a post can
+    only fail — usually after its other platforms have gone out, leaving it
+    half-published for the user to repair by hand.
+    """
+    if action not in _PUBLISH_COMMITTING_ACTIONS:
+        return None
+    selected_ids = _parse_selected_account_ids(request.POST.get("selected_accounts", ""))
+    if not selected_ids:
+        return None
+
+    accounts = list(SocialAccount.objects.filter(id__in=selected_ids, workspace=workspace))
+    # Skip the media lookup when no selected platform cares about it.
+    if not any(requires_media(account.platform) for account in accounts):
+        return None
+    media_types = _composer_media_types(request, post, workspace)
+    blocked = [account for account in accounts if media_blocker(account, media_types=media_types)]
+    if not blocked:
+        return None
+
+    # Worded apart from media_blocker's because this form can also be fixed by
+    # deselecting the account, and it names every platform at once.
+    video_only = sorted({a.get_platform_display() for a in blocked if is_video_only(a.platform)})
+    any_media = sorted({a.get_platform_display() for a in blocked if not is_video_only(a.platform)})
+    sentences = []
+    if video_only:
+        sentences.append(f"{get_text_list(video_only, 'and')} can only publish videos.")
+    if any_media:
+        verb = "needs" if len(any_media) == 1 else "need"
+        sentences.append(f"{get_text_list(any_media, 'and')} {verb} an image or a video.")
+    # A video satisfies every platform on the list, so ask for one when any
+    # video-only platform is among them.
+    wanted = "a video" if video_only else "an image or a video"
+    which = "that account" if len(blocked) == 1 else "those accounts"
+    sentences.append(f"Add {wanted} to this post, or deselect {which}.")
+    return JsonResponse({"errors": {"media": " ".join(sentences)}}, status=400)
+
+
 def _save_version(post, user):
     """Create a PostVersion snapshot."""
+    from apps.social_accounts.youtube_compliance import authored_youtube_settings
+
     version_number = (post.versions.count()) + 1
     snapshot = {
         "title": post.title,
@@ -391,7 +470,9 @@ def _save_version(post, user):
                 "title_override": pp.platform_specific_title,
                 "caption_override": pp.platform_specific_caption,
                 "first_comment_override": pp.platform_specific_first_comment,
-                "platform_extra": pp.platform_extra or {},
+                "platform_extra": authored_youtube_settings(pp.platform_extra)
+                if pp.social_account.platform == "youtube"
+                else pp.platform_extra or {},
             }
             for pp in post.platform_posts.select_related("social_account")
         ],
@@ -595,6 +676,9 @@ def compose(request, workspace_id, post_id=None):
             # so the live counter can charge for them as the user types.
             "escaped_chars": acc.escaped_chars,
             "name": acc.account_name or acc.account_handle,
+            "youtube_url": f"https://www.youtube.com/channel/{acc.account_platform_id}"
+            if acc.platform == "youtube"
+            else "",
             **cfg,
         }
 
@@ -935,6 +1019,10 @@ def save_post(request, workspace_id, post_id=None):
     if pinterest_board_error is not None:
         return pinterest_board_error
 
+    media_error = _validate_required_media(request, post, workspace, action)
+    if media_error is not None:
+        return media_error
+
     # Handle action — note that Post itself no longer carries an editorial
     # status: every transition below operates on the PlatformPost children,
     # which is why we sync those before/after running it.
@@ -1236,6 +1324,15 @@ def transition_platform_post(request, workspace_id, post_id, platform_post_id):
 
     if pp.status == target:
         return JsonResponse({"ok": True, "status": pp.status, "noop": True})
+
+    if target in ("scheduled", "publishing"):
+        # save_post's own checks never see this endpoint: it moves one row
+        # straight to the publisher, so a failed image-only TikTok row could
+        # otherwise be "retried" into the same failure.
+        try:
+            require_publishable(pp)
+        except ValueError as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
 
     try:
         pp.transition_to(target)
@@ -2034,7 +2131,7 @@ def pinterest_boards(request, workspace_id, account_id):
     access_token = account.oauth_access_token
     if account.token_expires_at and account.is_token_expiring_soon:
         try:
-            access_token = account.refresh_oauth_token(provider)
+            access_token = account.refresh_oauth_token(provider, enqueue_backfill=False)
         except Exception:
             return JsonResponse({"error": "Token refresh failed"}, status=502)
 
@@ -2087,7 +2184,7 @@ def tiktok_creator_info(request, workspace_id, account_id):
     access_token = account.oauth_access_token
     if account.token_expires_at and account.is_token_expiring_soon:
         try:
-            access_token = account.refresh_oauth_token(provider)
+            access_token = account.refresh_oauth_token(provider, enqueue_backfill=False)
         except Exception:
             return _unavailable("Token refresh failed")
 
@@ -2299,6 +2396,15 @@ def remove_media(request, workspace_id, post_id, media_id):
     """Remove a media attachment from a post."""
     workspace = _get_workspace(request, workspace_id)
     post = get_object_or_404(Post, id=post_id, workspace=workspace)
+    attachment = PostMedia.objects.filter(id=media_id, post=post).first()
+    if attachment is not None:
+        # Taking the last video off a post already scheduled to TikTok, or the
+        # last image off a pin, would leave it queued to fail. Plain text,
+        # because the global htmx error toast shows the body as-is and a 4xx
+        # doesn't swap.
+        reason = media_change_blocker(post, media_types_after=post_media_types(post, excluding=attachment))
+        if reason:
+            return HttpResponse(reason, status=400, content_type="text/plain")
     PostMedia.objects.filter(id=media_id, post=post).delete()
 
     # Option A: changing media on an approved post sends it back for re-approval.
@@ -3509,6 +3615,11 @@ def csv_confirm_import(request, workspace_id):
     rows = csv_data["rows"]
     created_count = 0
     error_count = 0
+    # Dated rows for platforms a CSV row can never satisfy: it carries no
+    # media and no Pinterest board. Those are kept as drafts at their date
+    # rather than scheduled to fail, and the result screen says so.
+    drafted_count = 0
+    drafted_platforms: set[str] = set()
 
     for row in rows:
         try:
@@ -3579,14 +3690,20 @@ def csv_confirm_import(request, workspace_id):
                             connection_status=SocialAccount.ConnectionStatus.CONNECTED,
                         )
                         for acc in accounts:
-                            PlatformPost.objects.get_or_create(
+                            status = initial_pp_status
+                            if status == "scheduled" and publish_blocker(acc, media_types=set()):
+                                status = "draft"
+                            _pp, created = PlatformPost.objects.get_or_create(
                                 post=post,
                                 social_account=acc,
                                 defaults={
-                                    "status": initial_pp_status,
+                                    "status": status,
                                     "scheduled_at": post.scheduled_at,
                                 },
                             )
+                            if created and status != initial_pp_status:
+                                drafted_count += 1
+                                drafted_platforms.add(acc.get_platform_display())
 
             created_count += 1
         except Exception:
@@ -3604,6 +3721,8 @@ def csv_confirm_import(request, workspace_id):
             "created_count": created_count,
             "error_count": error_count,
             "total_rows": len(rows),
+            "drafted_count": drafted_count,
+            "drafted_platforms": get_text_list(sorted(drafted_platforms), "and"),
         },
     )
 

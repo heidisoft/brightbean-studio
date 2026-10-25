@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
 from .base import SocialProvider
-from .exceptions import OAuthError, ProviderError, PublishError, QuotaExceededError, TokenExpiredError
+from .exceptions import APIError, OAuthError, ProviderError, PublishError, QuotaExceededError, TokenExpiredError
 from .google_errors import (
     AUTH_REASONS,
     QUOTA_REASONS,
@@ -43,6 +44,13 @@ API_BASE = "https://www.googleapis.com/youtube/v3"
 UPLOAD_BASE = "https://www.googleapis.com/upload/youtube/v3"
 ANALYTICS_BASE = "https://youtubeanalytics.googleapis.com/v2"
 
+# ``videos.insert``: both the resumable-session POST and the PUT that carries
+# the bytes, whose Location URL keeps this path and adds an ``upload_id``.
+# Matched on the path rather than the whole upload host, because
+# ``thumbnails.set`` lives under ``/upload/`` too but is charged to the regular
+# pool.
+_VIDEOS_INSERT_PATH = urlsplit(f"{UPLOAD_BASE}/videos").path
+
 # YouTube Analytics caps a ``filters=video==<id>,<id>,...`` list at 500 IDs
 # per request. Larger inputs to :meth:`YouTubeProvider.get_post_analytics`
 # are split into multiple requests transparently.
@@ -57,6 +65,62 @@ _DATA_API_VIDEO_ID_CHUNK = 50
 # daily quota). Long enough for a burst to clear, short enough that a momentary
 # spike doesn't cost the rest of the day's syncing.
 _THROTTLE_COOLDOWN = timedelta(minutes=5)
+
+# Bounds on a routine comment poll. Both exist because ``commentThreads.list``
+# charges a quota unit per page against a budget the whole deployment shares,
+# and an unbounded walk of a channel's history repeated all day is what spends
+# it. See :meth:`YouTubeProvider.get_messages`.
+#
+# The lookback is the width of the early exit, not a guess at clock skew: a
+# comment thread sorts by its *top-level* comment, so a thread answered a minute
+# ago can sit behind threads published hours later. Two hours buys several pages
+# of slack on a busy channel; anything a reply older than that needs is the
+# weekly deep sweep's job, because no finite lookback catches a reply to a
+# year-old video.
+_COMMENT_LOOKBACK = timedelta(hours=2)
+
+# The backstop for a channel busy enough that even its recent traffic runs past
+# the lookback. Five pages is 500 threads — far more than a 30-minute window
+# produces on any real channel, so hitting it means something unusual.
+_MAX_COMMENT_PAGES = 5
+
+# The deep sweep's ceiling. Larger, because walking further back is its whole
+# job — but not absent: without a cap a channel with 50,000 threads spends 500
+# units in one synchronous call inside a 5-minute cycle, which is the exact
+# failure the bounds above exist to prevent. 50 pages reaches 5,000 threads,
+# deep enough that anything past it is history no comment poll should be
+# reconstructing.
+_MAX_DEEP_COMMENT_PAGES = 50
+
+
+def _quota_scope_for(url: str) -> str:
+    """Which of YouTube's separately metered budgets a request to ``url`` spends.
+
+    Read off the request because the response cannot say: Google refuses a
+    spent budget with the same ``quotaExceeded`` / ``youtube.quota`` whichever
+    one it is. The request can — only the Analytics host spends the Analytics
+    quota, and only ``videos.insert`` spends the upload bucket.
+
+    Each is kept apart because a block is keyed on this name, and a refusal
+    filed under the wrong one stops calls that still have budget: the
+    Analytics sync because the Data API ran dry, or the inbox, analytics and
+    health checks for the rest of the day because 100 uploads went out.
+
+    ``search.list`` has its own bucket too, but nothing here calls it.
+    """
+    if url.startswith(ANALYTICS_BASE):
+        return "analytics"
+    if urlsplit(url).path.rstrip("/") == _VIDEOS_INSERT_PATH:
+        return "upload"
+    return "data"
+
+
+class YouTubeMessageBatch(list[InboxMessage]):
+    """Messages plus the cursor left by a page cap, if the walk is incomplete."""
+
+    def __init__(self, messages: list[InboxMessage], next_page_token: str | None = None):
+        super().__init__(messages)
+        self.next_page_token = next_page_token
 
 
 class YouTubeProvider(SocialProvider):
@@ -106,11 +170,19 @@ class YouTubeProvider(SocialProvider):
 
     @property
     def rate_limits(self) -> RateLimitConfig:
+        # Since 2026-06-01 the Data API meters three daily budgets, each per
+        # Google Cloud project (so shared by every channel on this deployment)
+        # and each reset at midnight US/Pacific: ``videos.insert`` and
+        # ``search.list`` get 100 calls apiece at 1 unit a call, and every other
+        # method shares the regular 10,000 units. An upload therefore no longer
+        # spends the pool the inbox, analytics and health check live on — its
+        # custom thumbnail (``thumbnails.set``, 50 units) and first comment
+        # (``commentThreads.insert``, 50) still do.
         return RateLimitConfig(
             requests_per_hour=600,
             requests_per_day=10000,
-            publish_per_day=6,
-            extra={"quota_units_per_day": 10000, "upload_cost_units": 1600},
+            publish_per_day=100,
+            extra={"quota_units_per_day": 10000, "videos_insert_per_day": 100, "search_list_per_day": 100},
         )
 
     # ------------------------------------------------------------------
@@ -186,7 +258,7 @@ class YouTubeProvider(SocialProvider):
     # Profile
     # ------------------------------------------------------------------
 
-    def get_profile(self, access_token: str) -> AccountProfile:
+    def get_profile(self, access_token: str, *, channel_id: str | None = None) -> AccountProfile:
         resp = self._request(
             "GET",
             f"{API_BASE}/channels",
@@ -198,7 +270,21 @@ class YouTubeProvider(SocialProvider):
         if not items:
             return AccountProfile(platform_id="", name="Unknown")
 
-        channel = items[0]
+        if channel_id:
+            while not any(item.get("id") == channel_id for item in items) and body.get("nextPageToken"):
+                resp = self._request(
+                    "GET",
+                    f"{API_BASE}/channels",
+                    access_token=access_token,
+                    params={"part": "snippet,statistics", "mine": "true", "pageToken": body["nextPageToken"]},
+                )
+                body = resp.json()
+                items = body.get("items", [])
+            channel = next((item for item in items if item.get("id") == channel_id), None)
+            if channel is None:
+                return AccountProfile(platform_id="", name="Unknown")
+        else:
+            channel = items[0]
         snippet = channel.get("snippet", {})
         stats = channel.get("statistics", {})
         thumbnails = snippet.get("thumbnails", {})
@@ -224,6 +310,7 @@ class YouTubeProvider(SocialProvider):
             raise PublishError(
                 "YouTube only supports VIDEO and SHORT post types",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         title = content.title or content.text or ""
@@ -314,12 +401,15 @@ class YouTubeProvider(SocialProvider):
             return PublishResult(
                 platform_post_id=video_id,
                 url=f"https://www.youtube.com/watch?v={video_id}" if video_id else None,
-                extra=upload_body,
+                # The ID above is sufficient. Persisting the resource here
+                # also copies it into composer settings, clones and history.
+                extra={},
             )
 
         raise PublishError(
             "No video file provided (media_files required)",
             platform=self.platform_name,
+            retryable=False,
         )
 
     # ------------------------------------------------------------------
@@ -354,21 +444,87 @@ class YouTubeProvider(SocialProvider):
     # Inbox
     # ------------------------------------------------------------------
 
-    def get_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
-        # Resolve channel ID
-        ch_resp = self._request(
-            "GET",
-            f"{API_BASE}/channels",
-            access_token=access_token,
-            params={"part": "id", "mine": "true"},
-        )
-        ch_items = ch_resp.json().get("items", [])
-        if not ch_items:
-            return []
-        channel_id = ch_items[0]["id"]
+    def get_messages(
+        self,
+        access_token: str,
+        since: datetime | None = None,
+        *,
+        deep: bool = False,
+        page_token: str | None = None,
+        channel_id: str | None = None,
+        stored_reply_counts: Callable[[list[str]], Mapping[str, int]] | None = None,
+    ) -> YouTubeMessageBatch:
+        """Comment threads on this channel, newest first.
+
+        ``commentThreads.list`` costs a quota unit per page, and the Data API
+        grants 10,000 units a day to the whole OAuth client — every account
+        connected to this deployment, not each one. So walking a channel's
+        entire comment history on a poll that repeats all day is the one thing
+        this must not do: ten channels deep-paging every five minutes spend the
+        day's budget before noon, and then nearly everything YouTube stops —
+        the inbox, analytics, reconnecting the accounts, and the thumbnail and
+        first comment on each new video — until the quota rolls over at
+        midnight US/Pacific. Only the upload itself carries on, because
+        ``videos.insert`` draws on a bucket of its own.
+
+        A normal poll therefore stops early. ``order=time`` returns threads
+        newest first, so once a page ends older than ``since`` there is nothing
+        newer behind it. ``_COMMENT_LOOKBACK`` widens that edge, because a
+        thread sorts by its *top-level* comment: one answered today can sit
+        pages deep behind its original publish date. ``_MAX_COMMENT_PAGES`` is
+        the backstop for a channel whose recent traffic alone runs long.
+
+        ``deep=True`` drops the early exit for the weekly sweep and raises the
+        per-call page cap. A capped batch returns ``next_page_token`` so the
+        caller can resume later without spending an unbounded number of units
+        in one cycle. It still honours ``since`` when deciding what to emit.
+
+        The two ``since`` filters below are deliberately separate. A thread
+        whose top-level comment predates ``since`` can still carry a reply
+        posted seconds ago, so skipping the whole thread — as this did — lost
+        the reply with it.
+
+        ``channel_id`` is the channel stored at connect time. Passing it skips
+        the ``channels.list`` lookup, which was half of every routine poll's
+        cost for an answer that never changes. Without it the lookup still
+        runs, for a row that predates the stored id.
+
+        ``stored_reply_counts`` is asked, once per page, how many replies are
+        already stored for the threads on that page that YouTube only partly
+        embeds. A history walk otherwise fetches every reply page of every such
+        thread, even one the previous sweep imported in full. A thread is
+        skipped only when the stored count *equals* ``totalReplyCount``: a
+        higher stored count means replies were deleted upstream and may hide a
+        new one, so it is fetched. Embedded replies are always read.
+        """
+        if not channel_id:
+            # Counted before the call, not after, so a request that raises
+            # still shows up in the tally — and counted with ``+=`` so an auth
+            # retry adds to what the first attempt bought instead of replacing
+            # it. A refusal on quota is not charged upstream, so this is a
+            # ceiling on the real spend, which is the safe direction to be
+            # wrong in. See SocialProvider.last_call_quota_units.
+            self.last_call_quota_units += 1
+            ch_resp = self._request(
+                "GET",
+                f"{API_BASE}/channels",
+                access_token=access_token,
+                params={"part": "id", "mine": "true"},
+            )
+            ch_items = ch_resp.json().get("items", [])
+            if not ch_items:
+                return YouTubeMessageBatch([])
+            channel_id = ch_items[0]["id"]
+
+        # How far back a page may reach before paging stops. ``None`` means "no
+        # floor" — a first sync (no ``since``) and the deep sweep both want the
+        # page cap, or nothing at all, to be what ends the walk.
+        cutoff = None if (since is None or deep) else since - _COMMENT_LOOKBACK
+        max_pages = _MAX_DEEP_COMMENT_PAGES if deep else _MAX_COMMENT_PAGES
 
         messages: list[InboxMessage] = []
-        page_token: str | None = None
+        pages = 0
+        continuation: str | None = None
 
         while True:
             params: dict = {
@@ -380,6 +536,7 @@ class YouTubeProvider(SocialProvider):
             if page_token:
                 params["pageToken"] = page_token
 
+            self.last_call_quota_units += 1
             resp = self._request(
                 "GET",
                 f"{API_BASE}/commentThreads",
@@ -387,35 +544,61 @@ class YouTubeProvider(SocialProvider):
                 params=params,
             )
             body = resp.json()
+            pages += 1
+
+            # The oldest thread on this page, for the early exit below. Read
+            # from the response rather than tracked through the loop so a
+            # thread skipped for emission still counts toward how far back the
+            # page reached.
+            oldest_on_page: datetime | None = None
+
+            # Threads YouTube only partly embedded. Looked up per page so a
+            # walk capped at a few pages never loads the whole history's counts.
+            stored_counts: Mapping[str, int] = {}
+            if (deep or since is None) and stored_reply_counts is not None:
+                partial = [
+                    thread["snippet"]["topLevelComment"]["id"]
+                    for thread in body.get("items", [])
+                    if thread["snippet"].get("totalReplyCount", 0) > len(thread.get("replies", {}).get("comments", []))
+                ]
+                if partial:
+                    stored_counts = stored_reply_counts(partial)
 
             for thread in body.get("items", []):
                 top_snippet = thread["snippet"]["topLevelComment"]["snippet"]
                 published = datetime.fromisoformat(top_snippet["publishedAt"].replace("Z", "+00:00"))
-
-                if since and published < since:
-                    continue
+                if oldest_on_page is None or published < oldest_on_page:
+                    oldest_on_page = published
 
                 top_comment_id = thread["snippet"]["topLevelComment"]["id"]
                 video_id = top_snippet["videoId"]
 
-                messages.append(
-                    InboxMessage(
-                        platform_message_id=top_comment_id,
-                        sender_id=top_snippet.get("authorChannelId", {}).get("value", ""),
-                        sender_name=top_snippet.get("authorDisplayName", ""),
-                        text=top_snippet.get("textDisplay", ""),
-                        timestamp=published,
-                        message_type="comment",
-                        extra={
-                            "video_id": video_id,
-                            "comment_id": top_comment_id,
-                            "sender_avatar_url": top_snippet.get("authorProfileImageUrl", ""),
-                        },
+                if not since or published >= since:
+                    messages.append(
+                        InboxMessage(
+                            platform_message_id=top_comment_id,
+                            sender_id=top_snippet.get("authorChannelId", {}).get("value", ""),
+                            sender_name=top_snippet.get("authorDisplayName", ""),
+                            text=top_snippet.get("textDisplay", ""),
+                            timestamp=published,
+                            message_type="comment",
+                            extra={
+                                "video_id": video_id,
+                                "comment_id": top_comment_id,
+                                "sender_avatar_url": top_snippet.get("authorProfileImageUrl", ""),
+                            },
+                        )
                     )
-                )
 
-                # Include reply comments in the thread
-                for reply in thread.get("replies", {}).get("comments", []):
+                # YouTube embeds only a subset for threads with many replies.
+                # A full history walk must fetch the rest or its new replies to
+                # old threads can remain invisible despite reaching the thread.
+                replies = thread.get("replies", {}).get("comments", [])
+                total_replies = thread["snippet"].get("totalReplyCount", 0)
+                already_stored = stored_counts.get(top_comment_id) == total_replies
+                if (deep or since is None) and total_replies > len(replies) and not already_stored:
+                    replies = self._all_comment_replies(access_token, top_comment_id)
+                for reply in replies:
                     r_snippet = reply["snippet"]
                     r_published = datetime.fromisoformat(r_snippet["publishedAt"].replace("Z", "+00:00"))
                     if since and r_published < since:
@@ -441,7 +624,46 @@ class YouTubeProvider(SocialProvider):
             if not page_token:
                 break
 
-        return messages
+            # Newest-first ordering means a page that already reaches past the
+            # cutoff has nothing newer behind it.
+            if cutoff is not None and oldest_on_page is not None and oldest_on_page < cutoff:
+                break
+
+            if pages >= max_pages:
+                # Not an error — a busy channel legitimately runs long. Worth
+                # saying out loud because a channel that caps every poll is one
+                # whose older comments only ever reach the inbox via the weekly
+                # deep sweep, and one that caps the *sweep* has history no
+                # comment poll will ever reach.
+                logger.warning(
+                    "YouTube comment poll hit the %d-page cap for channel %s (deep=%s)",
+                    max_pages,
+                    channel_id,
+                    deep,
+                )
+                continuation = page_token
+                break
+
+        return YouTubeMessageBatch(messages, continuation)
+
+    def _all_comment_replies(self, access_token: str, parent_id: str) -> list[dict]:
+        """Fetch every reply when ``commentThreads.list`` embeds only a subset.
+
+        This is used for initial imports and deep sweeps, not the frequent
+        routine poll. The latter stays bounded by its thread-page allowance.
+        """
+        replies: list[dict] = []
+        page_token: str | None = None
+        while True:
+            params = {"part": "snippet", "parentId": parent_id, "maxResults": 100}
+            if page_token:
+                params["pageToken"] = page_token
+            self.last_call_quota_units += 1
+            body = self._request("GET", f"{API_BASE}/comments", access_token=access_token, params=params).json()
+            replies.extend(body.get("items", []))
+            page_token = body.get("nextPageToken")
+            if not page_token:
+                return replies
 
     def reply_to_comment(self, access_token: str, comment_id: str, text: str, extra: dict | None = None) -> ReplyResult:
         """Reply to a comment. YouTube answers on the comments endpoint, so this is the same call."""
@@ -499,15 +721,11 @@ class YouTubeProvider(SocialProvider):
         body = self._safe_json(response)
         reasons = google_error_reasons(body)
         now = now or datetime.now(UTC)
-        # The Data API and the Analytics API are metered separately, so record
-        # which budget ran dry — blocking the cheap batched Analytics call
-        # because the Data API is exhausted throws away the one part of the
-        # sync that was never the problem.
-        scope = "analytics" if str(response.url).startswith(ANALYTICS_BASE) else "data"
+        scope = _quota_scope_for(str(response.url))
 
         if reasons & QUOTA_REASONS:
             return QuotaExceededError(
-                f"{self.platform_name} daily quota exhausted ({scope} API)",
+                f"{self.platform_name} daily quota exhausted ({scope} quota)",
                 resets_at=next_google_quota_reset(now),
                 quota_scope=scope,
                 status_code=response.status_code,
@@ -517,7 +735,7 @@ class YouTubeProvider(SocialProvider):
 
         if reasons & THROTTLE_REASONS:
             return QuotaExceededError(
-                f"{self.platform_name} request rate throttled ({scope} API)",
+                f"{self.platform_name} request rate throttled ({scope} quota)",
                 resets_at=now + _THROTTLE_COOLDOWN,
                 quota_scope=scope,
                 status_code=response.status_code,
@@ -601,8 +819,95 @@ class YouTubeProvider(SocialProvider):
             engagements=likes + comments,
             extra={
                 "favorite_count": int(stats.get("favoriteCount", 0)),
+                "reported_metrics": {
+                    key: float(stats[api_key])
+                    for api_key, key in (("viewCount", "views"), ("likeCount", "likes"), ("commentCount", "comments"))
+                    if api_key in stats
+                },
             },
         )
+
+    def get_comments_by_id(self, access_token, comment_ids):
+        """Refresh retained comments, including replies and edited text."""
+        result = {}
+        for offset in range(0, len(comment_ids), 50):
+            ids = comment_ids[offset : offset + 50]
+            try:
+                response = self._request(
+                    "GET",
+                    f"{API_BASE}/comments",
+                    access_token=access_token,
+                    params={"part": "snippet", "id": ",".join(ids), "textFormat": "plainText"},
+                )
+            except APIError as exc:
+                if exc.status_code != 404:
+                    raise
+                # A single missing ID can fail the whole batch. Isolate it;
+                # never delete every other comment based on that one 404.
+                if len(ids) > 1:
+                    split = len(ids) // 2
+                    result.update(self.get_comments_by_id(access_token, ids[:split]))
+                    result.update(self.get_comments_by_id(access_token, ids[split:]))
+                continue
+            result.update({item["id"]: item.get("snippet", {}) for item in response.json().get("items", [])})
+        return result
+
+    _CHANNEL_METRICS = {
+        "views": "views",
+        "likes": "likes",
+        "comments": "comments",
+        "shares": "shares",
+        "estimatedMinutesWatched": "watch_time",
+        "averageViewPercentage": "avg_view_pct",
+        "subscribersGained": "subscribers",
+    }
+
+    def _channel_report(self, access_token, channel_id, start, end, *, daily=False):
+        """Parse columns by name; only returned numeric cells are observations."""
+        import math
+        from datetime import date
+
+        params = {
+            "ids": f"channel=={channel_id}",
+            "startDate": start.isoformat(),
+            "endDate": end.isoformat(),
+            "metrics": ",".join(self._CHANNEL_METRICS),
+        }
+        if daily:
+            params.update(dimensions="day", sort="day", maxResults=200)
+        result = []
+        while True:
+            body = self._request("GET", f"{ANALYTICS_BASE}/reports", access_token=access_token, params=params).json()
+            columns = [h.get("name") for h in body.get("columnHeaders", [])]
+            rows = body.get("rows", [])
+            for cells in rows:
+                record = dict(zip(columns, cells, strict=False))
+                metrics = {}
+                for api_key, key in self._CHANNEL_METRICS.items():
+                    value = record.get(api_key)
+                    if value is not None:
+                        try:
+                            number = float(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(number):
+                            metrics[key] = number
+                if daily:
+                    if record.get("day"):
+                        day = date.fromisoformat(record["day"])
+                        if start <= day <= end:
+                            result.append({"date": day, "metrics": metrics})
+                else:
+                    return metrics
+            if not daily or len(rows) < 200:
+                return result if daily else {}
+            params["startIndex"] = params.get("startIndex", 1) + len(rows)
+
+    def get_channel_daily_metrics(self, access_token, channel_id, start, end):
+        return self._channel_report(access_token, channel_id, start, end, daily=True)
+
+    def get_channel_period_metrics(self, access_token, channel_id, start, end):
+        return self._channel_report(access_token, channel_id, start, end)
 
     def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
         """Channel-level metrics from the YouTube Analytics API.
@@ -778,6 +1083,8 @@ class YouTubeProvider(SocialProvider):
                         shares_value = None
 
                 if extra or shares_value is not None:
+                    if shares_value is not None:
+                        extra["reported_metrics"] = {"shares": shares_value}
                     result[video_id] = PostMetrics(shares=shares_value or 0, extra=extra)
         return result
 
@@ -790,9 +1097,10 @@ class YouTubeProvider(SocialProvider):
             self._request(
                 "POST",
                 REVOKE_URL,
-                params={"token": access_token},
+                data={"token": access_token},
+                timeout=5,
             )
             return True
         except Exception:
-            logger.exception("Failed to revoke YouTube token")
+            logger.warning("YouTube revocation deferred; retry via encrypted outbox")
             return False
