@@ -50,6 +50,12 @@ STORAGES.pop("archive", None)  # noqa: F405
 CONTENT_RETENTION_DEFAULT_DAYS = 60
 CONTENT_RETENTION_DRAFT_DEFAULT_DAYS = 30
 
+# Pinned for the same reason as STORAGE_BACKEND: base.py reads them from .env,
+# so a developer trying either feature locally would flip every signup test.
+# Tests that want them set use the `settings` fixture.
+CUSTOM_SIGNUP_URL = ""
+SIGNUP_MODE = "open"
+
 # Use simple static files storage in tests (no manifest/collectstatic needed)
 STORAGES["staticfiles"] = {  # noqa: F405
     "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",

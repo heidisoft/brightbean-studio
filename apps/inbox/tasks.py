@@ -3,17 +3,23 @@
 import logging
 import re
 from datetime import timedelta
+from functools import partial
 from typing import Any
 
 from background_task import background
+from django.conf import settings
+from django.db import transaction
+from django.db.models import Count
+from django.db.models.fields.json import KT
 from django.utils import timezone
 
+from apps.common import quota
 from apps.members.models import WorkspaceMembership
 from apps.notifications.engine import notify
 from apps.notifications.models import EventType
 from apps.social_accounts.models import SocialAccount
 from providers import get_provider
-from providers.exceptions import ProviderError, TokenExpiredError
+from providers.exceptions import ProviderError, QuotaExceededError, TokenExpiredError
 from providers.google_errors import google_error_reasons
 
 from .models import InboxMessage, InboxSLAConfig
@@ -26,6 +32,17 @@ logger = logging.getLogger(__name__)
 # account's genuinely-new first message still alerts instead of being swallowed.
 INBOX_BACKLOG_NOTIFY_WINDOW = timedelta(hours=1)
 _YOUTUBE_INBOX_REFRESH_WINDOW = timedelta(minutes=10)
+
+# Platforms whose provider implements the ``deep`` walk. Only YouTube needs it:
+# it is the only one whose routine poll stops early to protect a shared budget,
+# and so the only one with a gap for a sweep to close.
+_DEEP_SWEEP_PLATFORMS = ("youtube",)
+
+# How many accounts may advance a deep sweep or initial history import in one cycle.
+#
+# One, because accounts can come due together and a cycle that swept all of
+# them would spend in one pass what the routine early exit saves over a week.
+_DEEP_SWEEPS_PER_CYCLE = 1
 
 
 def _provider_failure_details(exc: Exception) -> tuple[int | None, str]:
@@ -56,6 +73,77 @@ def _queue_health_check(account: SocialAccount) -> None:
         check_social_account_health(str(account.id), remove_existing_tasks=True)
     except Exception as exc:
         logger.error("Could not queue inbox health check for account %s: error_type=%s", account.id, type(exc).__name__)
+
+
+def _stored_reply_counts(account, parent_ids: list[str]) -> dict[str, int]:
+    """How many replies the inbox already holds for each of ``parent_ids``.
+
+    Lets a history walk skip the reply pages of a thread it has already
+    imported in full. Asked per page, for that page's partly embedded threads
+    only, so a capped walk never aggregates the account's whole history.
+    """
+    return dict(
+        InboxMessage.objects.filter(social_account=account, extra__parent_id__in=parent_ids)
+        .annotate(parent=KT("extra__parent_id"))
+        .values("parent")
+        .annotate(n=Count("id"))
+        .values_list("parent", "n")
+    )
+
+
+def _full_reply_walk_due(account) -> bool:
+    """Whether this deep sweep must fetch every reply thread regardless of counts.
+
+    A stored count can match ``totalReplyCount`` by coincidence — one reply
+    deleted upstream, one added — and the deleted row lingers until the
+    compliance refresh removes it, or forever where enforcement is off. The
+    first sweep of each calendar month ignores the counts, so such a reply
+    waits at most about a month instead of indefinitely. Keyed off the last
+    completed sweep, which a cursor-resumed sweep leaves unchanged, so every
+    page of one sweep makes the same choice.
+    """
+    last = account.inbox_last_deep_sweep_at
+    if last is None:
+        return False
+    now = timezone.now()
+    return (last.year, last.month) != (now.year, now.month)
+
+
+def _since_last_full_reply_walk(account):
+    """The ``since`` a full reply walk needs to emit what the skipping sweeps missed.
+
+    The weekly sweep's ``since`` is the previous sweep, so a full walk that kept
+    it would fetch a skipped reply only to drop it as older than the cutoff —
+    after which nothing would ever look for it again. Every reply a skipping
+    sweep could have missed was posted after the last full walk began, and that
+    walk was the first sweep of the month the last sweep ran in: the start of
+    that month bounds them all. Re-emitting messages already stored only
+    refreshes them; ``_upsert_message`` notifies on creation alone.
+    """
+    last = account.inbox_last_deep_sweep_at
+    return last.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def youtube_message_kwargs(account, *, since, deep: bool = False, skip_stored_replies: bool = True) -> dict:
+    """Keyword arguments for ``YouTubeProvider.get_messages`` that save quota.
+
+    The stored channel id spares the ``channels.list`` lookup on every poll.
+
+    Reply counts go only to a routine deep sweep, the one walk whose misses the
+    monthly full walk recovers. A first import or an explicit backfill has no
+    later walk reaching back that far, and little stored to save on, so it
+    fetches every reply thread. ``skip_stored_replies=False`` is that choice for
+    callers that also sweep deep.
+    """
+    kwargs: dict = {"since": since, "deep": deep}
+    if account.account_platform_id:
+        kwargs["channel_id"] = account.account_platform_id
+    if deep and since is not None and skip_stored_replies:
+        if _full_reply_walk_due(account):
+            kwargs["since"] = min(since, _since_last_full_reply_walk(account))
+        else:
+            kwargs["stored_reply_counts"] = partial(_stored_reply_counts, account)
+    return kwargs
 
 
 def _is_recent(ts):
@@ -119,20 +207,158 @@ class InboxSyncEngine:
             connection_status=SocialAccount.ConnectionStatus.CONNECTED,
         ).select_related("workspace")
 
+        # One dict for the whole pass. Accounts overwhelmingly share a single
+        # OAuth client, so without it the breaker costs a query per account to
+        # answer the same question — see apps.common.quota.quota_blocked_until.
+        quota_cache: dict = {}
+        # What this pass cost, per platform. Reported at the end because the
+        # useful question is never "what did one poll cost" but "how close is
+        # the day to 10,000?" — and a per-cycle number multiplies straight out
+        # to a daily one. Without it the first sign of an exhausted budget is a
+        # user reporting their accounts have gone dead, which is how this was
+        # found the first time.
+        spend: dict[str, int] = {}
+        # Mutable so ``_claim_deep_sweep`` can spend from it; a list rather than
+        # an int because the count has to survive being passed down.
+        budget = [_DEEP_SWEEPS_PER_CYCLE]
+
         for account in accounts:
             try:
-                self._sync_account(account)
+                self._sync_account(account, quota_cache=quota_cache, spend=spend, budget=budget)
             except Exception:
                 logger.exception("Inbox sync failed for account %s", account.id)
 
-    def _sync_account(self, account):
+        if spend:
+            logger.info(
+                "Inbox cycle quota spend: %s",
+                ", ".join(f"{platform}={units}" for platform, units in sorted(spend.items())),
+            )
+
+    def _poll_is_too_soon(self, account) -> bool:
+        """Whether this account's platform floor says to leave it alone this cycle.
+
+        The cycle runs every 5 minutes for everyone; this is what lets a
+        platform with a shared daily budget opt out of most of those passes
+        without slowing the platforms that have no such limit.
+        """
+        minimum = settings.INBOX_PLATFORM_MIN_POLL_SECONDS.get(account.platform)
+        if not minimum or account.inbox_last_polled_at is None:
+            return False
+        return account.inbox_last_polled_at > timezone.now() - timedelta(seconds=minimum)
+
+    def _deep_sweep_due(self, account) -> bool:
+        """Whether this account is due a full walk of its comment history.
+
+        A null stamp is *not* due: this account is still importing its initial
+        history through a separate, resumable cursor.
+        """
+        if (
+            account.platform not in _DEEP_SWEEP_PLATFORMS
+            or account.inbox_last_deep_sweep_at is None
+            or account.inbox_initial_backfill_cursor
+        ):
+            return False
+        return bool(account.inbox_deep_sweep_cursor) or account.inbox_last_deep_sweep_at <= timezone.now() - timedelta(
+            seconds=settings.INBOX_DEEP_SWEEP_SECONDS
+        )
+
+    def _claim_deep_sweep(self, budget) -> bool:
+        """Take this cycle's sweep slot, if one is left.
+
+        Called only once ``_deep_sweep_due`` has said yes, so a cycle whose
+        accounts are all up to date never touches the budget.
+        """
+        if budget is None:
+            return True
+        if budget[0] <= 0:
+            return False
+        budget[0] -= 1
+        return True
+
+    def _mark_polled(
+        self,
+        account,
+        *,
+        deep: bool = False,
+        imported: bool = False,
+        started_at=None,
+        next_page_token: str | None = None,
+        instagram_dm_poll_state: dict | None = None,
+    ) -> None:
+        """Record that this account has been polled, so the floor can hold it off.
+
+        Stamped after a failed provider call as well as a successful one: a
+        platform that just refused us is not one to come back to in five
+        minutes. The one exception is a quota refusal, where the breaker — not
+        this clock — is what holds the account back, and re-stamping would
+        outlast it.
+
+        ``imported`` gates the sweep baseline. A capped walk stores its cursor
+        instead of claiming completion; a failure cannot advance either.
+        """
+        now = timezone.now()
+        fields = ["inbox_last_polled_at"]
+        account.inbox_last_polled_at = now
+        if imported and account.platform == "instagram" and instagram_dm_poll_state is not None:
+            account.instagram_dm_poll_state = instagram_dm_poll_state
+            fields.append("instagram_dm_poll_state")
+        if imported and account.platform == "youtube":
+            if deep:
+                sweep_start = account.inbox_deep_sweep_started_at or started_at
+                account.inbox_deep_sweep_cursor = next_page_token or ""
+                account.inbox_deep_sweep_started_at = sweep_start if next_page_token else None
+                fields.extend(["inbox_deep_sweep_cursor", "inbox_deep_sweep_started_at"])
+                if not next_page_token:
+                    # Use the start, not the end: a reply arriving on a page
+                    # already fetched during this sweep must remain eligible.
+                    account.inbox_last_deep_sweep_at = sweep_start
+                    fields.append("inbox_last_deep_sweep_at")
+            elif account.inbox_last_deep_sweep_at is None:
+                history_start = account.inbox_initial_backfill_started_at or started_at
+                account.inbox_initial_backfill_cursor = next_page_token or ""
+                account.inbox_initial_backfill_started_at = history_start if next_page_token else None
+                fields.extend(["inbox_initial_backfill_cursor", "inbox_initial_backfill_started_at"])
+                if not next_page_token:
+                    account.inbox_last_deep_sweep_at = history_start
+                    fields.append("inbox_last_deep_sweep_at")
+        elif deep or (imported and account.inbox_last_deep_sweep_at is None):
+            account.inbox_last_deep_sweep_at = started_at or now
+            fields.append("inbox_last_deep_sweep_at")
+        account.save(update_fields=[*fields, "updated_at"])
+
+    def _sync_account(self, account, *, quota_cache=None, spend=None, budget=None):
         """Sync messages for a single social account."""
         from apps.publisher.engine import _resolve_publish_credentials
 
+        if self._poll_is_too_soon(account):
+            return
+
         try:
-            provider = get_provider(account.platform, _resolve_publish_credentials(account))
+            credentials = _resolve_publish_credentials(account)
+            if account.platform == "instagram":
+                credentials["instagram_dm_poll_state"] = account.instagram_dm_poll_state
+            provider = get_provider(account.platform, credentials)
         except ValueError:
             logger.warning("No provider for platform %s", account.platform)
+            return
+
+        # The platform has already said "not until later". Polling anyway spends
+        # a request to be refused and — on YouTube, where the budget is shared
+        # across every account on this deployment — takes the refusal out of the
+        # same pool that reconnecting and a new video's first comment need.
+        credential = quota.credential_key(getattr(provider, "credentials", None))
+        # ``read_scope`` rather than a literal: a platform that meters one pool
+        # names it "", and hardcoding "data" here wrote a row the analytics sync
+        # — which resolves the same scope from the same map — never looked up.
+        scope = quota.read_scope(account.platform)
+        blocked_until = quota.quota_blocked_until(account.platform, credential, scope, cache=quota_cache)
+        if blocked_until:
+            logger.info(
+                "Inbox poll skipped for account %s: %s quota blocked until %s",
+                account.id,
+                account.platform,
+                blocked_until.isoformat(),
+            )
             return
 
         last_msg = (
@@ -150,12 +376,50 @@ class InboxSyncEngine:
             InboxMessage.objects.filter(social_account=account).values_list("message_type", flat=True).distinct()
         )
 
+        # One tally per account. The provider accumulates, so without this an
+        # account would inherit whatever the previous one spent.
+        provider.reset_quota_counter()
+
+        deep = self._deep_sweep_due(account) and self._claim_deep_sweep(budget)
+        poll_started_at = timezone.now()
+        # The sweep exists to find what the routine poll's early exit missed —
+        # which is, by definition, older than the newest message already
+        # imported. Reusing that high-water mark as ``since`` would filter those
+        # messages out again after paying for the whole walk, leaving a sweep
+        # that costs everything and recovers nothing. The window that matters is
+        # "since we last walked the history", so use that.
+        since = account.inbox_last_deep_sweep_at if deep else last_msg
+        page_token = (account.inbox_deep_sweep_cursor or None) if deep else None
+        next_page_token = None
+        history_message_ids: set[int] = set()
+
         try:
             if account.platform == "youtube":
-                messages = self._get_youtube_messages(account, provider, last_msg)
+                messages = self._get_youtube_messages(account, provider, since, deep=deep, page_token=page_token)
+                if messages is not None:
+                    next_page_token = getattr(messages, "next_page_token", None)
+                    if account.inbox_initial_backfill_cursor and self._claim_deep_sweep(budget):
+                        history = self._get_youtube_messages(
+                            account, provider, None, page_token=account.inbox_initial_backfill_cursor
+                        )
+                        if history is not None:
+                            history_message_ids = {id(msg) for msg in history}
+                            messages = [*messages, *history]
+                            next_page_token = getattr(history, "next_page_token", None)
+                        else:
+                            # A disconnected account did not advance its cursor.
+                            next_page_token = account.inbox_initial_backfill_cursor
+                    elif account.inbox_initial_backfill_cursor:
+                        next_page_token = account.inbox_initial_backfill_cursor
             else:
-                messages = provider.get_messages(access_token=account.oauth_access_token, since=last_msg)
+                messages = provider.get_messages(access_token=account.oauth_access_token, since=since)
         except NotImplementedError:
+            return
+        except QuotaExceededError as exc:
+            # Must precede ProviderError: QuotaExceededError subclasses
+            # RateLimitError, so the broader clause would swallow it and the
+            # next poll five minutes later would spend another doomed request.
+            quota.trip_from_exception(account.platform, credential, exc, cache=quota_cache)
             return
         except ProviderError as exc:
             status, reason = _provider_failure_details(exc)
@@ -166,6 +430,7 @@ class InboxSyncEngine:
                 status,
                 reason,
             )
+            self._mark_polled(account)
             return
         except Exception:
             logger.exception(
@@ -173,9 +438,17 @@ class InboxSyncEngine:
                 account.id,
                 account.platform,
             )
+            self._mark_polled(account)
             return
+        finally:
+            # In a finally because a call that failed partway still bought the
+            # pages it read before the failure, and a tally that only counted
+            # successes would understate the day's spend exactly when it
+            # matters most.
+            self._record_spend(provider, account, spend)
 
         if messages is None:
+            self._mark_polled(account)
             return
         if account.platform == "youtube":
             logger.info("YouTube inbox poll completed for account %s: %s messages", account.id, len(messages))
@@ -189,7 +462,7 @@ class InboxSyncEngine:
             # a backlog, so a blanket mute would silently swallow it.
             # backfill_inbox seeds explicit history silently (notify=False).
             is_backlog = msg.message_type not in seen_types
-            notify_new = not is_backlog or _is_recent(msg.timestamp)
+            notify_new = (not is_backlog or _is_recent(msg.timestamp)) and id(msg) not in history_message_ids
             self._upsert_message(
                 account,
                 msg,
@@ -197,13 +470,42 @@ class InboxSyncEngine:
                 related_post_id=related_posts.get(_related_post_key(msg.extra)),
             )
 
-    def _get_youtube_messages(self, account, provider, since):
-        """Refresh a stale YouTube token, with one auth retry and no backfill fan-out."""
+        self._mark_polled(
+            account,
+            deep=deep,
+            imported=True,
+            started_at=poll_started_at,
+            next_page_token=next_page_token,
+            instagram_dm_poll_state=getattr(messages, "poll_state", None),
+        )
+
+    def _record_spend(self, provider, account, spend) -> None:
+        """Add what this account's poll cost to the cycle's running total.
+
+        Reads ``last_call_quota_units``, which providers that meter a shared
+        budget set and the rest leave at zero — so platforms without one simply
+        never appear in the tally.
+        """
+        if spend is None:
+            return
+        units = getattr(provider, "last_call_quota_units", 0) or 0
+        if units:
+            spend[account.platform] = spend.get(account.platform, 0) + units
+
+    def _get_youtube_messages(self, account, provider, since, *, deep: bool = False, page_token: str | None = None):
+        """Refresh a stale YouTube token, with one auth retry and no backfill fan-out.
+
+        ``deep`` is passed straight through to the provider, which is where it
+        decides how far to page; nothing about the token dance changes with it.
+        """
         account.refresh_from_db(
             fields=["oauth_access_token", "oauth_refresh_token", "token_expires_at", "connection_status"]
         )
         if account.connection_status != SocialAccount.ConnectionStatus.CONNECTED:
             return None
+        message_kwargs = youtube_message_kwargs(account, since=since, deep=deep)
+        if page_token:
+            message_kwargs["page_token"] = page_token
         access_token = account.oauth_access_token
         refresh_attempted = False
         refresh_failed = None
@@ -224,7 +526,7 @@ class InboxSyncEngine:
                     _queue_health_check(account)
 
         try:
-            return provider.get_messages(access_token=access_token, since=since)
+            return provider.get_messages(access_token=access_token, **message_kwargs)
         except TokenExpiredError as exc:
             status, reason = _provider_failure_details(exc)
             logger.warning(
@@ -263,7 +565,7 @@ class InboxSyncEngine:
             return None
 
         try:
-            messages = provider.get_messages(access_token=access_token, since=since)
+            messages = provider.get_messages(access_token=access_token, **message_kwargs)
         except TokenExpiredError as exc:
             status, reason = _provider_failure_details(exc)
             logger.warning(
@@ -277,6 +579,7 @@ class InboxSyncEngine:
         logger.info("YouTube inbox poll recovered for account %s", account.id)
         return messages
 
+    @transaction.atomic
     def _upsert_message(self, account, msg, notify=True, related_post_id=None):
         """Create or update an inbox message, deduplicating by platform_message_id."""
         defaults = {
@@ -289,14 +592,32 @@ class InboxSyncEngine:
             "received_at": msg.timestamp,
             "extra": msg.extra,
         }
+        if account.platform == "youtube":
+            from apps.social_accounts.models import SocialAccount
+
+            if (
+                not SocialAccount.objects.select_for_update()
+                .filter(pk=account.pk, youtube_data_generation=account.youtube_data_generation)
+                .exists()
+            ):
+                return
+            defaults["api_refreshed_at"] = timezone.now()
         if related_post_id:
             defaults["related_post_id"] = related_post_id
 
-        obj, created = InboxMessage.objects.update_or_create(
+        obj, created = InboxMessage.objects.select_for_update().get_or_create(
             social_account=account,
             platform_message_id=msg.platform_message_id,
             defaults=defaults,
         )
+        if not created:
+            defaults["extra"] = {**(obj.extra or {}), **defaults["extra"]}
+            if (obj.extra or {}).get("is_deleted"):
+                defaults["body"] = ""
+                defaults["extra"].update(is_deleted=True, attachments=[])
+            for key, value in defaults.items():
+                setattr(obj, key, value)
+            obj.save(update_fields=list(defaults))
         if created:
             obj.sentiment = analyze_sentiment(obj.body)
             obj.save(update_fields=["sentiment"])
