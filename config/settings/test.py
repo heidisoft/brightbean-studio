@@ -43,6 +43,13 @@ MEDIA_ROOT = BASE_DIR / "test_media"  # noqa: F405
 MEDIA_URL = "/media/"
 SERVE_MEDIA = True
 
+# Same reasoning for the retention archive: never inherit a developer's real
+# cold-storage bucket. Tests that need one override STORAGES["archive"].
+ARCHIVE_STORAGE_BACKEND = ""
+STORAGES.pop("archive", None)  # noqa: F405
+CONTENT_RETENTION_DEFAULT_DAYS = 60
+CONTENT_RETENTION_DRAFT_DEFAULT_DAYS = 30
+
 # Use simple static files storage in tests (no manifest/collectstatic needed)
 STORAGES["staticfiles"] = {  # noqa: F405
     "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",

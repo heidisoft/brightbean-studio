@@ -76,6 +76,7 @@ LOCAL_APPS = [
     "apps.mcp",
     "apps.oauth_server",
     "apps.analytics",
+    "apps.content_retention",
     "theme",
 ]
 
@@ -253,6 +254,49 @@ else:
     MEDIA_ROOT = env("MEDIA_ROOT", default=str(BASE_DIR / "media"))
     MEDIA_URL = "/media/"
     SERVE_MEDIA = env.bool("SERVE_MEDIA", default=True)
+
+# Content retention (apps.content_retention). New posts get a deletion date
+# this many days after creation unless the workspace overrides it.
+CONTENT_RETENTION_DEFAULT_DAYS = env.int("CONTENT_RETENTION_DEFAULT_DAYS", default=60)
+# Drafts (posts that never reached a platform) have their own, shorter period,
+# counted from the draft's last edit rather than its creation.
+CONTENT_RETENTION_DRAFT_DEFAULT_DAYS = env.int("CONTENT_RETENTION_DRAFT_DEFAULT_DAYS", default=30)
+
+# Optional cold storage that expired post content is copied to before it is
+# purged. Unset means "archive" is not offered and retention only deletes.
+# Point it at a separate, cheaper bucket (or storage class) than the hot media
+# bucket: archived objects are written once and almost never read.
+ARCHIVE_STORAGE_BACKEND = env("ARCHIVE_STORAGE_BACKEND", default="").lower()
+if ARCHIVE_STORAGE_BACKEND == "s3":
+    STORAGES["archive"] = {
+        "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
+        "OPTIONS": {
+            "bucket_name": env("ARCHIVE_S3_BUCKET_NAME", default=""),
+            # Credentials and endpoint fall back to the media bucket's so a
+            # second bucket on the same account needs only its name. ``or``
+            # rather than ``default=``: .env.example lists these blank, and a
+            # blank value must mean "fall back", not "empty".
+            "endpoint_url": env("ARCHIVE_S3_ENDPOINT_URL", default="") or env("S3_ENDPOINT_URL", default="") or None,
+            "access_key": env("ARCHIVE_S3_ACCESS_KEY_ID", default="") or env("S3_ACCESS_KEY_ID", default=""),
+            "secret_key": env("ARCHIVE_S3_SECRET_ACCESS_KEY", default="") or env("S3_SECRET_ACCESS_KEY", default=""),
+            "region_name": env("ARCHIVE_S3_REGION_NAME", default="") or env("S3_REGION_NAME", default="auto"),
+            "default_acl": "private",
+            "file_overwrite": False,
+            "querystring_auth": True,
+            # e.g. STANDARD_IA / GLACIER_IR on AWS; R2 accepts STANDARD_IA
+            # (Infrequent Access). Empty leaves the bucket default.
+            "object_parameters": (
+                {"StorageClass": env("ARCHIVE_S3_STORAGE_CLASS")} if env("ARCHIVE_S3_STORAGE_CLASS", default="") else {}
+            ),
+        },
+    }
+elif ARCHIVE_STORAGE_BACKEND == "local":
+    STORAGES["archive"] = {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+        # Never let a blank ARCHIVE_ROOT reach FileSystemStorage: an empty
+        # location falls back to MEDIA_ROOT, which is served publicly.
+        "OPTIONS": {"location": env("ARCHIVE_ROOT", default="") or str(BASE_DIR / "archive")},
+    }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 

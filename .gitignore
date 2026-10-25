@@ -208,6 +208,7 @@ __marimo__/
 # Project-specific
 staticfiles/
 media/
+archive/
 test_media/
 node_modules/
 theme/static/css/dist/
