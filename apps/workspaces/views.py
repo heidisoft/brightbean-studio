@@ -198,3 +198,83 @@ def approvals_settings(request, workspace_id):
             "approval_modes": Workspace.ApprovalWorkflowMode,
         },
     )
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def retention_settings(request, workspace_id):
+    from apps.content_retention import services as retention
+    from apps.content_retention.tasks import run_workspace_content_retention
+
+    try:
+        workspace = Workspace.objects.get(id=workspace_id)
+    except Workspace.DoesNotExist:
+        raise Http404 from None
+
+    membership = WorkspaceMembership.objects.filter(user=request.user, workspace=workspace).first()
+    if not membership:
+        raise Http404
+
+    is_owner_or_manager = membership.workspace_role in (
+        WorkspaceMembership.WorkspaceRole.OWNER,
+        WorkspaceMembership.WorkspaceRole.MANAGER,
+    )
+
+    if request.method == "POST":
+        if not is_owner_or_manager:
+            raise Http404
+
+        if request.POST.get("action") == "run_now":
+            run_workspace_content_retention(str(workspace.id))
+            messages.success(request, "Cleanup queued. Due posts will be processed in the background shortly.")
+            return redirect("workspaces:retention_settings", workspace_id=workspace.id)
+
+        periods = {}
+        for field in ("retention_days", "draft_retention_days"):
+            try:
+                periods[field] = int(request.POST.get(field, ""))
+            except ValueError:
+                periods[field] = 0
+            if not retention.MIN_RETENTION_DAYS <= periods[field] <= retention.MAX_RETENTION_DAYS:
+                messages.error(
+                    request,
+                    f"Retention periods must be between {retention.MIN_RETENTION_DAYS} "
+                    f"and {retention.MAX_RETENTION_DAYS} days.",
+                )
+                return redirect("workspaces:retention_settings", workspace_id=workspace.id)
+
+        try:
+            redated = retention.save_policy(
+                workspace,
+                enabled=request.POST.get("retention_enabled") == "1",
+                days=periods["retention_days"],
+                action=request.POST.get("retention_action", ""),
+                drafts_enabled=request.POST.get("drafts_enabled") == "1",
+                draft_days=periods["draft_retention_days"],
+                apply_to_existing=request.POST.get("apply_to_existing") == "1",
+            )
+        except ValueError as exc:
+            messages.error(request, str(exc))
+            return redirect("workspaces:retention_settings", workspace_id=workspace.id)
+
+        if redated:
+            messages.success(request, f"Content retention updated. {redated} existing post(s) re-dated.")
+        else:
+            messages.success(request, "Content retention updated.")
+        return redirect("workspaces:retention_settings", workspace_id=workspace.id)
+
+    return render(
+        request,
+        "workspaces/retention_settings.html",
+        {
+            "workspace": workspace,
+            "settings_active": "retention",
+            "is_owner_or_manager": is_owner_or_manager,
+            "policy": retention.get_policy(workspace.id, workspace.organization_id),
+            "archive_available": retention.archive_available(),
+            "overview": retention.retention_overview(workspace),
+            "last_run": retention.get_last_run(workspace.id),
+            "min_days": retention.MIN_RETENTION_DAYS,
+            "max_days": retention.MAX_RETENTION_DAYS,
+        },
+    )

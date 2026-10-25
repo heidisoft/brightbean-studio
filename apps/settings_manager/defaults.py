@@ -40,6 +40,15 @@ APP_DEFAULTS = {
     "notifications.quiet_hours_end": None,
     "notifications.digest_mode": False,
     "onboarding.client_connection_link_expiry_days": 7,
+    # Content retention (apps.content_retention). retention.days' effective
+    # default is settings.CONTENT_RETENTION_DEFAULT_DAYS, retention.draft_days'
+    # is settings.CONTENT_RETENTION_DRAFT_DEFAULT_DAYS; retention.action's is
+    # "archive" when archive storage is configured.
+    "retention.enabled": True,
+    "retention.days": 60,
+    "retention.action": "delete",
+    "retention.drafts_enabled": True,
+    "retention.draft_days": 30,
     # Self-hosted infrastructure defaults
     "infra.account_health_check_hours": 6,
     "infra.token_refresh_check_hours": 1,

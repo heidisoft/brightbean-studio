@@ -1,0 +1,176 @@
+{% extends "layouts/workspace_settings.html" %}
+{% load humanize %}
+{% block title %}Content Retention - {{ workspace.name }} - Brightbean{% endblock %}
+{% block content %}
+<div class="max-w-2xl">
+    <h2 class="text-xl font-semibold mb-2" style="color: var(--text-primary);">Content Retention</h2>
+    <p class="text-sm mb-8" style="color: var(--text-secondary);">
+        Automatically clean up old post content to save storage. Every new post gets a deletion date
+        when it is created. Analytics for published posts are always kept: their stats, platform links
+        and a short caption snippet remain, and only the media, version history, comments and full text are removed.
+    </p>
+
+    {# Overview #}
+    <div class="grid grid-cols-2 gap-3 mb-8">
+        <div class="p-4 rounded-lg" style="border: 1px solid var(--border); background: var(--surface-0);">
+            <div class="text-xs mb-1" style="color: var(--text-secondary);">Due for cleanup now</div>
+            <div class="text-xl font-semibold" style="color: var(--text-primary);">{{ overview.due_now|intcomma }}</div>
+        </div>
+        <div class="p-4 rounded-lg" style="border: 1px solid var(--border); background: var(--surface-0);">
+            <div class="text-xs mb-1" style="color: var(--text-secondary);">Expected in the next 30 days</div>
+            <div class="text-xl font-semibold" style="color: var(--text-primary);">{{ overview.due_next_30_days|intcomma }}</div>
+        </div>
+        <div class="p-4 rounded-lg" style="border: 1px solid var(--border); background: var(--surface-0);">
+            <div class="text-xs mb-1" style="color: var(--text-secondary);">Already cleaned (stats kept)</div>
+            <div class="text-xl font-semibold" style="color: var(--text-primary);">{{ overview.purged|intcomma }}</div>
+        </div>
+        <div class="p-4 rounded-lg" style="border: 1px solid var(--border); background: var(--surface-0);">
+            <div class="text-xs mb-1" style="color: var(--text-secondary);">Posts with no deletion date</div>
+            <div class="text-xl font-semibold" style="color: var(--text-primary);">{{ overview.without_date|intcomma }}</div>
+        </div>
+    </div>
+
+    <form method="POST" x-data="{ enabled: {{ policy.enabled|yesno:'true,false' }}, drafts: {{ policy.drafts_enabled|yesno:'true,false' }}, action: '{{ policy.action }}' }">
+        {% csrf_token %}
+        <fieldset {% if not is_owner_or_manager %}disabled{% endif %}>
+
+        <label class="flex items-start gap-3 p-4 rounded-lg cursor-pointer mb-6"
+               style="border: 1px solid var(--border); background: var(--surface-0);">
+            <input type="checkbox" name="retention_enabled" value="1" x-model="enabled" class="mt-1"
+                   {% if policy.enabled %}checked{% endif %}>
+            <div class="flex-1">
+                <div class="text-sm font-semibold mb-0.5" style="color: var(--text-primary);">Clean up old content automatically</div>
+                <div class="text-xs" style="color: var(--text-secondary);">
+                    When off, new posts get no deletion date and nothing is cleaned up.
+                </div>
+            </div>
+        </label>
+
+        <div x-show="enabled">
+            <label for="retention_days" class="block text-sm font-semibold mb-2" style="color: var(--text-primary);">
+                Published posts: keep content for
+            </label>
+            <div class="flex items-center gap-3 mb-1">
+                <input type="number" id="retention_days" name="retention_days" value="{{ policy.days }}"
+                       min="{{ min_days }}" max="{{ max_days }}" required
+                       class="input-focus w-32 px-3 py-2 text-sm rounded-lg outline-none transition-colors"
+                       style="border: 1px solid var(--border); color: var(--text-primary); background: var(--surface-0);">
+                <span class="text-sm" style="color: var(--text-secondary);">days after a post is created</span>
+            </div>
+            <p class="text-xs mb-6" style="color: var(--text-tertiary);">
+                Between {{ min_days }} and {{ max_days|intcomma }} days. Their analytics are always kept.
+                Posts that are scheduled, publishing or in review are never cleaned up, even after their date passes;
+                they are picked up once they settle.
+            </p>
+
+            <div class="p-4 rounded-lg mb-6" style="border: 1px solid var(--border); background: var(--surface-0);">
+                <label class="flex items-start gap-3 cursor-pointer">
+                    <input type="checkbox" name="drafts_enabled" value="1" x-model="drafts" class="mt-1"
+                           {% if policy.drafts_enabled %}checked{% endif %}>
+                    <div class="flex-1">
+                        <div class="text-sm font-semibold mb-0.5" style="color: var(--text-primary);">Clean up drafts separately</div>
+                        <div class="text-xs" style="color: var(--text-secondary);">
+                            Drafts and other posts that were never published (rejected, failed) have no analytics,
+                            so they follow their own period, counted from the last time they were edited.
+                            When off, unpublished posts are kept.
+                        </div>
+                    </div>
+                </label>
+                <div x-show="drafts" class="flex items-center gap-3 mt-3" style="padding-left: 1.75rem;">
+                    <input type="number" id="draft_retention_days" name="draft_retention_days" value="{{ policy.draft_days }}"
+                           min="{{ min_days }}" max="{{ max_days }}" required aria-label="Draft retention period in days"
+                           class="input-focus w-32 px-3 py-2 text-sm rounded-lg outline-none transition-colors"
+                           style="border: 1px solid var(--border); color: var(--text-primary); background: var(--surface-0);">
+                    <span class="text-sm" style="color: var(--text-secondary);">days without an edit</span>
+                </div>
+            </div>
+
+            <div class="text-sm font-semibold mb-2" style="color: var(--text-primary);">When content expires</div>
+            <div class="flex flex-col gap-3 mb-6">
+                <label class="flex items-start gap-3 p-4 rounded-lg transition-colors"
+                       :style="action === 'archive'
+                            ? 'border: 1px solid var(--primary); background: var(--primary-soft, var(--surface-0)); box-shadow: 0 0 0 3px var(--primary-ring);'
+                            : 'border: 1px solid var(--border); background: var(--surface-0);'"
+                       {% if not archive_available %}style="cursor: not-allowed; opacity: 0.6;"{% else %}style="cursor: pointer;"{% endif %}>
+                    <input type="radio" name="retention_action" value="archive" x-model="action" class="mt-1"
+                           {% if not archive_available %}disabled{% endif %}
+                           {% if policy.action == 'archive' %}checked{% endif %}>
+                    <div class="flex-1">
+                        <div class="text-sm font-semibold mb-0.5" style="color: var(--text-primary);">Archive, then remove</div>
+                        <div class="text-xs" style="color: var(--text-secondary);">
+                            A full copy of the post (text, media, comments, version history) is moved to low-cost
+                            archive storage before it is removed here.
+                            {% if not archive_available %}
+                            <br><strong>Unavailable:</strong> archive storage is not configured on this server
+                            (<code>ARCHIVE_STORAGE_BACKEND</code>).
+                            {% endif %}
+                        </div>
+                    </div>
+                </label>
+                <label class="flex items-start gap-3 p-4 rounded-lg cursor-pointer transition-colors"
+                       :style="action === 'delete'
+                            ? 'border: 1px solid var(--primary); background: var(--primary-soft, var(--surface-0)); box-shadow: 0 0 0 3px var(--primary-ring);'
+                            : 'border: 1px solid var(--border); background: var(--surface-0);'">
+                    <input type="radio" name="retention_action" value="delete" x-model="action" class="mt-1"
+                           {% if policy.action == 'delete' %}checked{% endif %}>
+                    <div class="flex-1">
+                        <div class="text-sm font-semibold mb-0.5" style="color: var(--text-primary);">Remove permanently</div>
+                        <div class="text-xs" style="color: var(--text-secondary);">
+                            Content is deleted with no copy kept. Analytics for published posts are still kept.
+                        </div>
+                    </div>
+                </label>
+            </div>
+        </div>
+
+        <label class="flex items-start gap-3 mb-8 cursor-pointer">
+            <input type="checkbox" name="apply_to_existing" value="1" class="mt-1">
+            <div class="text-xs" style="color: var(--text-secondary);">
+                <span class="font-semibold" style="color: var(--text-primary);">Also apply to existing posts.</span>
+                Re-dates every post that hasn't been cleaned up yet to its creation date plus this period
+                (or clears the dates when automatic cleanup is off). Older posts may then be cleaned up on the next run.
+                Without this, changes only affect posts created from now on.
+            </div>
+        </label>
+
+        {% if is_owner_or_manager %}
+        <button type="submit"
+                class="btn-neutral px-5 py-2 text-sm font-medium rounded-full cursor-pointer whitespace-nowrap"
+                style="background: var(--neutral-100); color: var(--text-primary);">
+            Save Changes
+        </button>
+        {% endif %}
+        </fieldset>
+    </form>
+
+    <div class="mt-10 pt-6" style="border-top: 1px solid var(--border);">
+        <div class="flex items-start justify-between gap-4">
+            <div>
+                <div class="text-sm font-semibold mb-1" style="color: var(--text-primary);">Cleanup runs</div>
+                <p class="text-xs" style="color: var(--text-secondary);">
+                    Cleanup runs automatically once a day.
+                    {% if last_run %}
+                    Last run {{ last_run.ran_at|slice:":10" }}: {{ last_run.purged|intcomma }} cleaned,
+                    {{ last_run.deleted|intcomma }} unpublished removed{% if last_run.errors %}, {{ last_run.errors }} failed{% endif %},
+                    {{ last_run.bytes_freed|filesizeformat }} of media freed.
+                    All time: {{ last_run.total_purged|intcomma }} cleaned, {{ last_run.total_deleted|intcomma }} removed,
+                    {{ last_run.total_bytes_freed|filesizeformat }} freed.
+                    {% else %}
+                    It hasn't run for this workspace yet.
+                    {% endif %}
+                </p>
+            </div>
+            {% if is_owner_or_manager and policy.enabled %}
+            <form method="POST">
+                {% csrf_token %}
+                <input type="hidden" name="action" value="run_now">
+                <button type="submit"
+                        class="btn-surface-neutral-50 px-4 py-2 text-sm font-medium rounded-full cursor-pointer whitespace-nowrap">
+                    Run now
+                </button>
+            </form>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

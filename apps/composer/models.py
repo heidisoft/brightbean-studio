@@ -264,6 +264,16 @@ class Post(models.Model):
     # is actually scheduled.
     proposed_publish_at = models.DateTimeField(blank=True, null=True)
 
+    # Content retention (apps.content_retention). ``delete_after`` is stamped
+    # on creation from the workspace's retention period; NULL means "keep
+    # forever" (retention was off when the post was made, or it predates the
+    # feature). Once the date passes, the daily sweep purges the post's
+    # content — published posts keep their rows (and so their analytics) and
+    # lose only the heavy content; ``content_purged_at`` records that.
+    delete_after = models.DateTimeField(blank=True, null=True, db_index=True)
+    content_purged_at = models.DateTimeField(blank=True, null=True)
+    content_archive_path = models.CharField(max_length=512, blank=True, default="", db_default="")
+
     # Metadata
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -277,6 +287,20 @@ class Post(models.Model):
     def __str__(self):
         snippet = (self.caption[:50] + "...") if len(self.caption) > 50 else self.caption
         return f"Post({self.status}): {snippet or '(no caption)'}"
+
+    def save(self, *args, **kwargs):
+        # Stamp the default deletion date here rather than in each creation
+        # path (composer, API, MCP, CSV import, idea conversion) so none can
+        # forget it.
+        if self._state.adding and self.delete_after is None and self.workspace_id:
+            from apps.content_retention.services import default_delete_after
+
+            self.delete_after = default_delete_after(self.workspace_id)
+        super().save(*args, **kwargs)
+
+    @property
+    def is_content_purged(self):
+        return self.content_purged_at is not None
 
     # ------------------------------------------------------------------
     # Derived status (aggregated across PlatformPost children)

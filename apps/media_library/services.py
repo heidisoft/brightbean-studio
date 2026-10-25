@@ -666,7 +666,7 @@ def sweep_orphaned_media(
     cutoff = timezone.now() - timedelta(days=min_age_days)
     emit(f"Scanning assets older than {min_age_days} days (cutoff: {cutoff:%Y-%m-%d %H:%M})")
 
-    referenced = _fk_referenced_asset_ids() | _json_referenced_asset_ids()
+    referenced = referenced_asset_ids()
     emit(f"Referenced assets: {len(referenced)}")
 
     orphaned_qs = MediaAsset.objects.filter(created_at__lt=cutoff).exclude(id__in=referenced)
@@ -716,6 +716,15 @@ def sweep_orphaned_media(
         f"{result['errors']} errors (of {total} orphaned)"
     )
     return result
+
+
+def referenced_asset_ids():
+    """Every asset ID still referenced by a post, idea, or template.
+
+    The same definition of "in use" the orphan sweep applies, exposed for
+    other cleanup paths (content retention) that must agree with it.
+    """
+    return _fk_referenced_asset_ids() | _json_referenced_asset_ids()
 
 
 def _fk_referenced_asset_ids():
