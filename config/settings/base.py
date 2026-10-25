@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import environ
@@ -210,7 +211,9 @@ USE_TZ = True
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_DIRS = [BASE_DIR / "static"]
-STORAGES = {
+# Annotated: the "archive" alias below nests an OPTIONS dict, which mypy would
+# otherwise reject against the str-only shape inferred from this literal.
+STORAGES: dict[str, dict[str, Any]] = {
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
     },
